@@ -1,0 +1,7 @@
+{
+  "name": "SimplePlugin",
+  "author": "ity",
+  "main": "plugin.SimplePlugin",
+  "description": "A simple plugin for mindustry servers.",
+  "version": 147.1
+}
