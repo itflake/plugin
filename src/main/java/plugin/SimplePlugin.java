@@ -37,7 +37,6 @@ import arc.struct.*;
 import arc.Core;
 
 import static mindustry.Vars.netServer;
-import static mindustry.Vars.player;
 import static plugin.TokenManager.cleanUpExpiredTokens;
 
 public class SimplePlugin extends Plugin {
@@ -125,12 +124,13 @@ public class SimplePlugin extends Plugin {
         playtimeData.put(playerUUID, mins);
         saveTime();
     }
+
     public static void loadRank() {
-        if (playtimeFile.exists()) {
+        if (rankFile.exists()) {
             try {
                 String content = rankFile.readString();
                 if (!content.equals("{}")) {
-                    ObjectMap<String, Float> loadedData = json.fromJson(ObjectMap.class, content);
+                    ObjectMap<String, Integer> loadedData = json.fromJson(ObjectMap.class, content);
                     if (loadedData != null) {
                         rankData.clear();
                         rankData.putAll(loadedData);
@@ -351,7 +351,7 @@ public class SimplePlugin extends Plugin {
                 int score = 50 / total;
                 for (Player p : winners) {
                     addRank(p.uuid(), score);
-                    p.sendMessage("[#D1DBF2DD]+ " + score + " points[]");
+                    p.sendMessage("[#D1DBF2DD]You got " + score + " points![]");
                 }
                 Call.sendMessage("[#D1DBF2DD]Congratulations to [#" + e.winner.color.toString() + "]" + e.winner.name + "[] team for winning the match![]");
             }
@@ -447,14 +447,15 @@ public class SimplePlugin extends Plugin {
                     team.data().players.each(p -> {
                         if (Vars.state.rules.mode() == Gamemode.pvp) {
                             localeAsyncOne("Your team has lost. Please wait for the next round.", p);
-                            p.team(Team.derelict);
-                            Seq<Player> losers = Groups.player.copy().select(other -> other.team() == team);
-                            int penalty = 50 / losers.size;
-                            int old = rankData.get(p.uuid());
+                            int size = Math.max(1, team.data().players.size); // 或者你想用 losers 的实际数量
+                            int penalty = 50 / size;
+                            Integer oldValue = rankData.get(p.uuid());
+                            int old = oldValue != null ? oldValue : 0;
                             int updated = Math.max(0, old - penalty);
                             updateRankTime(p.uuid(), updated);
-                            p.sendMessage("[#D1DBF2FF]- " + penalty + " points[]");
-                            lostTeam.put(player.uuid(), true);
+                            p.sendMessage("[#D1DBF2FF]You lost " + penalty + " points[]!");
+                            lostTeam.put(p.uuid(), true);
+                            p.team(Team.derelict);
                             p.clearUnit();
                         } else {
                             localeAsyncOne("You lost this game.", p);
@@ -544,10 +545,6 @@ public class SimplePlugin extends Plugin {
         String content =
                 """
 Click "Confirm" to start.
-
-No sabotage or griefing.
-
-Any form of sabotage or rule-breaking will result in a permanent ban.
                 """;
 
         String[] options = new String[]{"Cancel", "Confirm"};
@@ -643,10 +640,11 @@ Any form of sabotage or rule-breaking will result in a permanent ban.
             "/t",
             "/tr [language]/auto/off",
             "/time",
+            "/rank [page]",
             "/rtv [map]",
+            "/rollback [name/index]",
             "/maps [page]",
             "/upload",
-            "/rollback [name/index]",
             "/vote y/n",
             "/votekick [player]"
     );
@@ -781,24 +779,25 @@ Any form of sabotage or rule-breaking will result in a permanent ban.
 
         handler.<Player>register("upload", "", (args, player) -> {
             String playerUUID = player.uuid();
-            float current = playtimeData.containsKey(playerUUID) ? playtimeData.get(playerUUID) : 0f;
-            if (current > 300 || player.admin) {
+            int current = rankData.containsKey(playerUUID) ? rankData.get(playerUUID) : 0;
+            if (current > 3000 || player.admin) {
                 String token = TokenManager.generateToken();
                 int port = config.port;
                 String url = "http://" + globalUrl + ":" + port + "/?token=" + token;
                 player.sendMessage("[#D1DBF2FF]Upload link (valid 5 min): " + url + "[]");
                 Call.openURI(player.con, url);
             } else {
-                localeAsyncOne("You do not meet the map upload requirements! To upload a map, you must have at least 300 minutes of game time on this server or be an admin. Maps must be under 200x200 in size and appropriate for the current game mode.", player);
+                localeAsyncOne("You do not meet the map upload requirements! To upload a map, you must have at least 3000 points on this server or be an admin. Maps must be under 200x200 in size and appropriate for the current game mode.", player);
             }
         });
 
 
-        handler.<Player>register("toggle", "Become admin if you have over 3000 minutes of playtime", (args, player) -> {
-            float totalMinutes = playtimeData.get(player.uuid(), 0f);
+        handler.<Player>register("toggle", "Become admin if you have over 10000 points", (args, player) -> {
+            String playerUUID = player.uuid();
+            int current = rankData.containsKey(playerUUID) ? rankData.get(playerUUID) : 0;
             boolean isApproved = approvedAdmins.getOrDefault(player.uuid(), false);
 
-            if (totalMinutes > 3000f || isApproved || player.admin) {
+            if (current > 10000 || isApproved || player.admin) {
 
                 if (!player.admin) {
                     player.admin = true;
@@ -811,8 +810,8 @@ Any form of sabotage or rule-breaking will result in a permanent ban.
                 }
 
             } else {
-                player.sendMessage("[#D1DBF2FF]You need at least 3000 minutes of total playtime to become admin. Current: "
-                        + String.format("%.2f", totalMinutes) + "[]");
+                player.sendMessage("[#D1DBF2FF]You need at least 10000 points to become admin. Current: "
+                        + String.format("%d", current) + "[]");
             }
         });
 
@@ -880,7 +879,7 @@ Any form of sabotage or rule-breaking will result in a permanent ban.
             player.sendMessage(mapList.toString());
         });
 
-        handler.<Player>register("rank", "[page]", "Show your rank and global rankings", (args, player) -> {
+        handler.<Player>register("rank", "[page]", "rankings", (args, player) -> {
             int page = 1;
             if (args.length > 0) {
                 try {
@@ -913,20 +912,20 @@ Any form of sabotage or rule-breaking will result in a permanent ban.
             int endIndex = Math.min(page * playersPerPage, totalPlayers);
 
             StringBuilder message = new StringBuilder();
-            message.append("[#D1DBF2FF]Global Rankings (Page ").append(page).append("/").append(totalPages).append("):[]\n");
+            message.append("[#FFFFFFFF]Rankings (Page ").append(page).append("/").append(totalPages).append("):[]\n");
 
             for (int i = startIndex; i < endIndex; i++) {
                 String id = uuids.get(i);
                 String name = Vars.netServer.admins.getInfo(id) != null ? Vars.netServer.admins.getInfo(id).lastName : "<unknown>";
                 int score = rankData.get(id, 0);
-                message.append("[#D1DBF2FF]").append(i + 1).append(". ").append(name).append(" - ").append(score).append(" pts[]\n");
+                message.append("[#D1DBF2FF]").append(i + 1).append(". ").append(name).append(" - ").append(score).append(" []\n");
             }
 
             int myScore = rankData.get(player.uuid(), 0);
             int myRank = uuids.indexOf(player.uuid(), true) + 1;
             if (myScore > 0) {
-                message.append("\n[#84f491]Your Rank: ").append(myRank).append("/").append(totalPlayers)
-                        .append(" | ").append(myScore).append(" pts[]");
+                message.append("\n[#D1DBF2FF]Your Rank: ").append(myRank).append("/").append(totalPlayers)
+                        .append(" | ").append(myScore).append(" []");
             } else {
                 message.append("\n[#84f491]You have no points yet.[]");
             }
