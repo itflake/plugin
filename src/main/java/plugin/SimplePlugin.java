@@ -443,22 +443,17 @@ public class SimplePlugin extends Plugin {
             var team = event.tile.team();
 
             if (event.tile.block() instanceof CoreBlock) {
-                if (team != Team.derelict && team.cores().size <= 1) {
+                if (team != Team.derelict && team.cores().size <= 1 ) {
                     team.data().players.each(p -> {
                         if (Vars.state.rules.mode() == Gamemode.pvp) {
                             localeAsyncOne("Your team has lost. Please wait for the next round.", p);
                             p.team(Team.derelict);
                             Seq<Player> losers = Groups.player.copy().select(other -> other.team() == team);
-                            if (losers.any()) {
-                                int penalty = 50 / losers.size;
-
-                                for (Player loser : losers) {
-                                    int old = rankData.get(loser.uuid());
-                                    int updated = Math.max(0, old - penalty);
-                                    updateRankTime(loser.uuid(), updated);
-                                    loser.sendMessage("[#D1DBF2FF]- " + penalty + " points[]");
-                                }
-                            }
+                            int penalty = 50 / losers.size;
+                            int old = rankData.get(p.uuid());
+                            int updated = Math.max(0, old - penalty);
+                            updateRankTime(p.uuid(), updated);
+                            p.sendMessage("[#D1DBF2FF]- " + penalty + " points[]");
                             lostTeam.put(player.uuid(), true);
                             p.clearUnit();
                         } else {
