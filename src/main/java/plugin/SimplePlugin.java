@@ -8,6 +8,7 @@ import mindustry.core.GameState;
 import mindustry.game.EventType.*;
 import mindustry.game.Gamemode;
 import mindustry.game.Team;
+import mindustry.game.Teams;
 import mindustry.gen.*;
 import mindustry.io.SaveIO;
 import mindustry.mod.*;
@@ -35,7 +36,6 @@ import arc.files.Fi;
 import arc.util.serialization.Json;
 import arc.struct.*;
 import arc.Core;
-
 import static mindustry.Vars.netServer;
 import static plugin.TokenManager.cleanUpExpiredTokens;
 
@@ -55,12 +55,16 @@ public class SimplePlugin extends Plugin {
     public static ServerConfig config = new ServerConfig();
     public Timer.Task end;
     public static final JsonReader reader = new JsonReader();
+    private final HashSet<String> lbEnabled = new HashSet<>();
+    private final StringBuilder updatedBuilder = new StringBuilder(); // Store leaderboard data here
     private static final double ratio = 0.6;
     private boolean currentVote = false;
     private Map currentMap = null;
+    private static final ObjectMap<String, Timer.Task> confirmTasks = new ObjectMap<>();
     private Gamemode currentMode = null;
     private Player initPlayer = null;
     private long gameStartTime = Time.millis();
+    private static boolean snowCommandUsed = false;
     private final HashSet<String> votes = new HashSet<>();
     private static final Set<String> knownIPs = new HashSet<>();
     private static final Fi ipFile = Vars.saveDirectory.child("ip-list.json");
@@ -71,10 +75,10 @@ public class SimplePlugin extends Plugin {
     private static final ObjectMap<String, Integer> rankData = new ObjectMap<>();
     private static final HashMap<String, Team> lastTeams = new HashMap<>();
     private static final HashSet<String> playersReturn = new HashSet<>();
-    private static final HashMap<String, Timer.Task> playerTasks = new HashMap<>();
     private static final HashMap<String, Team> playerTeams = new HashMap<>();
     private final HashMap<String, String> playerLang = new HashMap<>();
     private final HashMap<String, Boolean> approvedAdmins = new HashMap<>();
+    private final static HashSet<String> confirmedPlayers = new HashSet<>();
     private final HashMap<String, Boolean> lostTeam = new HashMap<>();
     private static final HashMap<String, String> languageMapping = new HashMap<String, String>() {{
         put("zh", "中文");
@@ -87,12 +91,26 @@ public class SimplePlugin extends Plugin {
         put("ru", "Русский");
         put("tr", "Türkçe");
     }};
+    public void resetGameState() {
+        currentVote = false;
+        currentMap = null;
+        currentMode = null;
+        initPlayer = null;
+        gameStartTime = Time.millis();
+        votes.clear();
+        lastTeams.clear();
+        playersReturn.clear();
+        playerTeams.clear();
+        lostTeam.clear();
+        end.cancel();
+        this.votes.clear();
+    }
 
     public static void loadTime() {
         if (playtimeFile.exists()) {
             try {
                 String content = playtimeFile.readString();
-                if (!content.equals("{}")) {
+                if (!content.trim().isEmpty()) {
                     ObjectMap<String, Float> loadedData = json.fromJson(ObjectMap.class, content);
                     if (loadedData != null) {
                         playtimeData.clear();
@@ -129,7 +147,7 @@ public class SimplePlugin extends Plugin {
         if (rankFile.exists()) {
             try {
                 String content = rankFile.readString();
-                if (!content.equals("{}")) {
+                if (!content.trim().isEmpty()) {
                     ObjectMap<String, Integer> loadedData = json.fromJson(ObjectMap.class, content);
                     if (loadedData != null) {
                         rankData.clear();
@@ -141,6 +159,7 @@ public class SimplePlugin extends Plugin {
             }
         }
     }
+
     public static void saveRank() {
         try {
             String jsonString = json.toJson(rankData);
@@ -149,6 +168,7 @@ public class SimplePlugin extends Plugin {
             Log.err("Failed to save rank data.", e);
         }
     }
+
     public static void addRank(String playerUUID, int rate) {
         int current = rankData.containsKey(playerUUID) ? rankData.get(playerUUID) : 0;
         updateRankTime(playerUUID, current + rate);
@@ -229,267 +249,150 @@ public class SimplePlugin extends Plugin {
             save();
         }
     }
+    public static void assignFallbackTeamIfNoCore(Player player) {
+        if (player == null || player.team() == null) {
+            Log.warn("Cannot assign fallback team: player or player team is null.");
+            return;
+        }
 
-    public SimplePlugin() {
-        Events.on(ServerLoadEvent.class, s -> {
-            load();
-            webInit();
-            loadTime();
-            loadRank();
-            Timer.schedule(() -> {
-                if (!Vars.state.isGame()) {
-                    Config.desc.set("Welcome to Snow!");return;
-                }
-                Groups.player.each(p -> addTime(p.uuid(), 0.06f));
-                long duration = Time.timeSinceMillis(gameStartTime);
-                int seconds = (int) (duration / 1000);
-                int minutes = seconds / 60;
-                Config.desc.set("[#EDF4FCBB]Game started [#EDF4FCFF]" + minutes + "[] minutes ago.[]");
-            }, 0f, 5f);
-            try {
-                server = new MapUploadServer(globalModeName, globalPort);
-            } catch (Exception e) {
-                Log.err("Web server failed to start:", e);
-            }
-            Timer.schedule(() -> {
-                cleanUpExpiredTokens();
-                long duration = Time.timeSinceMillis(gameStartTime);
-                int seconds = (int) (duration / 1000);
-                int minutes = seconds / 60;
-                Fi file = Core.files.local("config/snapshots/autosave-" + minutes + "m.msav");
-                SaveIO.save(file);
-            }, 70f, 70f);
+        boolean teamHasCore = Vars.state.teams.get(player.team()) != null &&
+                Vars.state.teams.get(player.team()).hasCore();
 
-            java.io.File folder = new java.io.File("config/snapshots");
-            if (folder.exists()) {
-                for (java.io.File file : Objects.requireNonNull(folder.listFiles((dir, name) -> name.startsWith("autosave-")))) {
-                    //noinspection ResultOfMethodCallIgnored
-                    file.delete();
-                }
-            }
-        });
-        Events.on(PlayerChatEvent.class, e -> {
-            Player sender = e.player;
-            String message = e.message;
-            if (currentMap != null && currentVote && (message.equals("y") || message.equals("yes")) && sender != initPlayer && !this.votes.contains(sender.uuid())) {
-                this.votes.add(sender.uuid());
-                int cur = this.votes.size();
-                int reqVotes = (int) Math.ceil(ratio * Groups.player.size());
-                Call.sendMessage("[#D1DBF2FF]" + sender.name + "[] voted to change the map. " + "[#D1DBF2FF]" + cur + "[] votes, [#D1DBF2FF]" + reqVotes + "[] required.[]");
-                int curVotes = this.votes.size();
-                if (curVotes >= reqVotes) {
-                    Call.sendMessage("[#D1DBF2FF]Vote passed! Map []" + currentMap.name() + " [#D1DBF2FF]will be loaded in 5 seconds...");
-                    Timer.schedule(() -> {
-                        gameStartTime = Time.millis();
-                        this.votes.clear();
-                        playerTeams.clear();
-                        lostTeam.clear();
-                        currentMode = Vars.state.rules.mode();
-                        java.io.File folder = new java.io.File("config/snapshots");
-                        if (folder.exists()) {
-                            for (java.io.File file : Objects.requireNonNull(folder.listFiles((dir, name) -> name.startsWith("autosave-")))) {
-                                //noinspection ResultOfMethodCallIgnored
-                                file.delete();
-                            }
-                        }
-                        if (currentMap != null) {
-                            reloadWorld(() -> {
-                                Vars.state.map = currentMap;
-                                Vars.world.loadMap(currentMap);
-                                Vars.state.rules = currentMap.applyRules(currentMode);
-                                Vars.logic.play();
-                                currentVote = false;
-                                currentMap = null;
-                            });
-                            end.cancel();
-                        }
-                    }, 5f);
-                }
-            }
-            Groups.player.each(receiver -> {
-                if (receiver == sender) return;
-                String messageLower = message.trim().toLowerCase();
-                String lang = playerLang.get(receiver.uuid());
-                if (receiver.locale.equals(sender.locale())) {
-                    return;
-                }
-                if (messageLower.startsWith("/") || messageLower.equals("back") || messageLower.equals("y") || messageLower.equals("yes")) {
-                    return;
-                }
-                if (lang == null || lang.equals("off")) return;
-                translate(message, "auto", lang, translated -> {
-                    if (!translated.equals(message)) {
-                        receiver.sendMessage("[gray]" + sender.name + ": " + translated + "[]");
-                    }
-                }, () -> localeAsyncOne("Translation failed!", receiver));
-            });
+        if (!teamHasCore) {
+            Team fallbackTeam = null;
+            int minPlayers = Integer.MAX_VALUE;
 
-        });
-        Events.on(PlayerLeave.class, e -> {
-            Player player = e.player;
-            if (votes.contains(player.uuid())) {
-                votes.remove(player.uuid());
-                int cur = this.votes.size();
-                int req = (int) Math.ceil(ratio * Groups.player.size());
-                Call.sendMessage("[#D1DBF2DD]" + player.name + "left, " + cur + " votes, " + req + " required.[]");
-            }
-            if (Vars.state.rules.mode() == Gamemode.pvp && player.team() != null) {
-                playerTeams.put(player.uuid(), player.team());
-            }
-        });
-        Events.on(GameOverEvent.class, e -> {
-            this.votes.clear();
-            lostTeam.clear();
-            playerTeams.clear();
-            gameStartTime = Time.millis();
-            if (e.winner != null &&
-                    e.winner != Team.derelict &&
-                    Vars.state.teams.get(e.winner).hasCore() &&
-                    Groups.player.count(p -> p.team() == e.winner) > 0) {
-                Seq<Player> winners = Groups.player.copy().select(p -> p.team() == e.winner);
-                int total = winners.size;
-                int score = 50 / total;
-                for (Player p : winners) {
-                    addRank(p.uuid(), score);
-                    p.sendMessage("[#D1DBF2DD]You got " + score + " points![]");
-                }
-                Call.sendMessage("[#D1DBF2DD]Congratulations to [#" + e.winner.color.toString() + "]" + e.winner.name + "[] team for winning the match![]");
-            }
-            java.io.File folder = new java.io.File("config/snapshots");
-            if (folder.exists()) {
-                for (java.io.File file : Objects.requireNonNull(folder.listFiles((dir, name) -> name.startsWith("autosave-")))) {
-                    //noinspection ResultOfMethodCallIgnored
-                    file.delete();
-                }
-            }
-        });
-        Events.on(PlayerJoin.class, e -> {
-            Player player = e.player;
-            String name = player.name;
-            String ip = player.con.address;
-            String playerUUID = player.uuid();
-            if (!isValidName(name)) {
-                String raw = "Your name is illegal or contains special characters or is longer than 40 characters.";
-                localeAsync(raw, player,
-                        translated -> player.con.kick(translated),
-                        () -> player.con.kick(raw)
-                );
-                return;
-            }
-            if (!playtimeData.containsKey(playerUUID)) {
-                updatePlaytime(playerUUID, 0f);
-            }
-            if (isNewIP(ip)) {
-                lastTeams.put(player.uuid(), player.team());
-                player.team(Team.derelict);
-                Timer.Task task = Timer.schedule(() -> {
-                    if (player.unit() != null) {
-                        player.clearUnit();
-                    }
-                }, 0f, 0.1f, 100);
-                playerTasks.put(player.uuid(), task);
-                confirm(player);
-            } else {
-                String motdRaw = "Welcome to snow!";
-                localeAsync(motdRaw, player,
-                        translated -> player.sendMessage("[#D1DBF2FF]" + translated + "[]"),
-                        () -> player.sendMessage("[#D1DBF2FF]" + motdRaw + "[]")
-                );
-            }
-            Team newTeam = playerTeams.get(player.uuid());
-            if (!Vars.state.teams.get(player.team()).hasCore() && newTeam == null && Vars.state.rules.mode() == Gamemode.pvp) {
-                Team fallbackTeam = null;
-                int minPlayers = Integer.MAX_VALUE;
-                for (Team team : Team.all) {
-                    if (team == Team.derelict || !Vars.state.teams.get(team).hasCore()) continue;
-                    int playerCount = Groups.player.count(p -> p.team() == team);
-                    if (playerCount < minPlayers) {
-                        fallbackTeam = team;
-                        minPlayers = playerCount;
-                    }
-                }
-                if (fallbackTeam != null && fallbackTeam != player.team()) {
-                    player.team(fallbackTeam);
-                    player.clearUnit();
+            for (Team team : Team.all) {
+                if (team == Team.derelict) continue;
+                var teamData = Vars.state.teams.get(team);
+                if (teamData == null || !teamData.hasCore()) continue;
+
+                int playerCount = Groups.player.count(p -> p.team() == team);
+                if (playerCount < minPlayers) {
+                    fallbackTeam = team;
+                    minPlayers = playerCount;
                 }
             }
 
-            if (newTeam != null && player.team() != newTeam && Vars.state.rules.mode() == Gamemode.pvp) {
-                if (newTeam == Team.derelict && Vars.state.rules.mode() == Gamemode.pvp && lostTeam.get(player.uuid())) {
-                    localeAsyncOne("Your team has lost. Please wait for the next round.", player);
-                    player.team(newTeam);
-                    player.clearUnit();
-                } else {
-                    lastTeams.put(player.uuid(), player.team());
-                    player.team(Team.derelict);
-                    Timer.Task task = Timer.schedule(() -> {
-                        if (player.unit() != null) {
-                            player.clearUnit();
-                        }
-                    }, 0f, 0.1f, 100);
-                    playerTasks.put(player.uuid(), task);
-                    playersReturn.add(player.uuid());
-                    welcome(player);
-                }
+            if (fallbackTeam != null && fallbackTeam != player.team()) {
+                player.team(fallbackTeam);
+                Log.info("Assigned fallback team " + fallbackTeam.name + " to player " + player.name);
             }
-            if (!playerLang.containsKey(player.uuid())) {
-                String lang = player.locale;
-                String detectedLang = lang == null ? "en" : lang;
-                playerLang.put(player.uuid(), detectedLang);
-            }
-        });
+        }
+    }
+    public void collectLeaderboardData() {
+        Seq<Player> onlineWithScore = Groups.player.copy().select(p -> rankData.get(p.uuid(), 0) > 0);
+        updatedBuilder.setLength(0);
+        updatedBuilder.append("[#FFFFFF]Leaderboard (Online):[]\n");
 
-        Events.on(BlockDestroyEvent.class, event -> {
-            var team = event.tile.team();
-
-            if (event.tile.block() instanceof CoreBlock) {
-                if (team != Team.derelict && team.cores().size <= 1 ) {
-                    team.data().players.each(p -> {
-                        if (Vars.state.rules.mode() == Gamemode.pvp) {
-                            localeAsyncOne("Your team has lost. Please wait for the next round.", p);
-                            int size = Math.max(1, team.data().players.size); // 或者你想用 losers 的实际数量
-                            int penalty = 50 / size;
-                            Integer oldValue = rankData.get(p.uuid());
-                            int old = oldValue != null ? oldValue : 0;
-                            int updated = Math.max(0, old - penalty);
-                            updateRankTime(p.uuid(), updated);
-                            p.sendMessage("[#D1DBF2FF]You lost " + penalty + " points[]!");
-                            lostTeam.put(p.uuid(), true);
-                            p.team(Team.derelict);
-                            p.clearUnit();
-                        } else {
-                            localeAsyncOne("You lost this game.", p);
-                        }
-                    });
-                }
+        if (!onlineWithScore.isEmpty()) {
+            onlineWithScore.sort((a, b) -> Integer.compare(rankData.get(b.uuid(), 0), rankData.get(a.uuid(), 0)));
+            for (int i = 0; i < onlineWithScore.size; i++) {
+                Player p = onlineWithScore.get(i);
+                int score = rankData.get(p.uuid(), 0);
+                updatedBuilder.append("[#D1DBF2FF]").append(i + 1).append(". ")
+                        .append(p.name).append(" - ")
+                        .append(score).append("[]\n");
             }
-        });
+        }
     }
 
-    private static final int menuId = Menus.registerMenu((player, choice) -> {
-        if (choice == 1) {
-            Team newTeam = playerTeams.get(player.uuid());
-            if (newTeam != null) player.team(newTeam);
-            Timer.Task playertask = playerTasks.remove(player.uuid());
-            if (playertask != null) playertask.cancel();
-            playersReturn.remove(player.uuid());
-            playerTeams.remove(player.uuid());
-        } else if (choice == 0) {
-            if (!playersReturn.contains(player.uuid())) return;
-            playersReturn.remove(player.uuid());
-            playerTeams.remove(player.uuid());
-            player.team(lastTeams.get(player.uuid()));
-            Timer.Task playertask = playerTasks.remove(player.uuid());
-            if (playertask != null) playertask.cancel();
-            lastTeams.remove(player.uuid());
+    public void showLeaderboard() {
+        Timer.schedule(() -> {
+            if (Groups.player.isEmpty()) return;
+            Groups.player.each(player -> {
+                if (!lbEnabled.contains(player.uuid())) return;
+                Call.infoPopup(player.con, updatedBuilder.toString(), 5f, 8, 0, 2, 50, 0);
+            });
+        }, 0f, 5f);
+    }
+
+    public static void translate(String text, String from, String to, Cons<String> result, Runnable error) {
+        Http.post("https://clients5.google.com/translate_a/t?client=dict-chrome-ex&dt=t", "tl=" + to + "&sl=" + from + "&q=" + Strings.encode(text))
+                .error(throwable -> error.run())
+                .submit(response -> result.get(reader.parse(response.getResultAsString()).get(0).get(0).asString()));
+    }
+
+    public static void localeAsync(String message, Player player, Cons<String> onResult, Runnable onError) {
+        String playerLocale = player.locale != null ? player.locale : "en";
+        translate(message, "auto", playerLocale, onResult, onError);
+    }
+
+    public static void localeAsyncAll(String message) {
+        Groups.player.each(player -> localeAsync(message, player,
+                translated -> player.sendMessage("[#D1DBF2FF]" + translated + "[]"),
+                () -> player.sendMessage("[#D1DBF2FF]" + message + "[]")
+        ));
+    }
+
+    public static void localeAsyncOne(String message, Player player) {
+        localeAsync(message, player,
+                translated -> player.sendMessage("[#D1DBF2FF]" + translated + "[]"),
+                () -> player.sendMessage("[#D1DBF2FF]" + message + "[]")
+        );
+    }
+
+    private void startVote(Player initiator, Map map) {
+        if (currentVote) return;
+        this.currentVote = true;
+        this.currentMap = map;
+        this.initPlayer = initiator;
+        this.votes.add(initiator.uuid());
+        int cur = this.votes.size();
+        int req = (int) Math.ceil(ratio * Groups.player.size());
+
+        if (req == 1 || initPlayer.admin) {
+            Call.sendMessage("[#D1DBF2FF]Vote passed. Map []" + currentMap.name() + " [#D1DBF2FF]will be loaded.[]");
+            currentMode = Vars.state.rules.mode();
+            java.io.File folder = new java.io.File("config/snapshots");
+            if (folder.exists()) {
+                for (java.io.File file : Objects.requireNonNull(folder.listFiles((dir, name) -> name.startsWith("autosave-")))) {
+                    //noinspection ResultOfMethodCallIgnored
+                    file.delete();
+                }
+            }
+
+            reloadWorld(() -> {
+                Vars.state.map = currentMap;
+                Vars.world.loadMap(currentMap);
+                Vars.state.rules = currentMap.applyRules(currentMode);
+                Vars.logic.play();
+                resetGameState();
+            });
+            return;
+        } else {
+            Call.sendMessage("[#FFFFFFFF]" + initiator.name + "[][#D1DBF2FF] voted to change the map to []" + map.name() + "[#FFFFFFFF]. " + cur + "[][#D1DBF2FF] votes, [][#FFFFFFFF]" + req + "[][#D1DBF2FF] required." + "\n" + "Type[] [#FFFFFFFF]y[] [#D1DBF2FF]to vote.[]");
         }
-    });
+
+        end = Timer.schedule(() -> {
+            if (currentVote) {
+                int curVotes = this.votes.size();
+                if (curVotes < req) {
+                    localeAsyncAll("Voted failed.");
+                    this.votes.clear();
+                    currentVote = false;
+                    currentMap = null;
+                }
+            }
+
+        }, 30f);
+    }
+
+    public static void reloadWorld(Runnable runnable) {
+        try {
+            WorldReloader reloader = new WorldReloader();
+            reloader.begin();
+            runnable.run();
+            reloader.end();
+        } catch (Exception e) {  // Catching general exception
+            Log.err("Error while reloading map: " + e.getMessage());
+        }
+    }
 
     public static void welcome(Player player) {
         String titleRaw = "Welcome back";
         String content = "Return to your previous game team?";
         String[] options = new String[]{"Cancel", "Confirm"};
-
 
         translate(titleRaw, "auto", player.locale, translatedTitle -> {
             String title = translatedTitle.equals(titleRaw) ? titleRaw : translatedTitle;
@@ -525,20 +428,32 @@ public class SimplePlugin extends Plugin {
 
     private static final int playerMenuId = Menus.registerMenu((player, choice) -> {
         if (choice == 1) {
-            player.team(lastTeams.get(player.uuid()));
-            lastTeams.remove(player.uuid());
-            Timer.Task playertask = playerTasks.remove(player.uuid());
-            if (playertask != null) playertask.cancel();
+            String playerUUID = player.uuid();
+            confirmedPlayers.add(playerUUID);
+            Team lastTeam = lastTeams.remove(player.uuid());
+            boolean validLastTeam = lastTeam != null &&
+                    Vars.state.teams.get(lastTeam) != null &&
+                    Vars.state.teams.get(lastTeam).hasCore();
+            if (validLastTeam) {
+                player.team(lastTeam);
+            } else {
+                assignFallbackTeamIfNoCore(player);
+            }
+            Timer.Task task = confirmTasks.remove(playerUUID);
+            if (task != null) {
+                task.cancel();
+            }
             addIP(player.con.address);
         } else if (choice == 0) {
-            String raw = "Click \"Confirm\" to enter the game.";
+            String playerUUID = player.uuid();
+            Timer.Task task = confirmTasks.remove(playerUUID);
+            if (task != null) {
+                task.cancel();
+            }
             player.con.kick();
-            localeAsync(raw, player,
-                    translated -> player.con.kick(translated),
-                    () -> player.con.kick(raw)
-            );
         }
     });
+
 
     public static void confirm(Player player) {
         String titleRaw = "Welcome to Snow";
@@ -635,40 +550,317 @@ Click "Confirm" to start.
     }
 
     private static final List<String> commands = Arrays.asList(
-            "/toggle",
-            "/snow",
-            "/t",
-            "/tr [language]/auto/off",
-            "/time",
-            "/rank [page]",
-            "/rtv [map]",
-            "/rollback [name/index]",
-            "/maps [page]",
-            "/upload",
-            "/vote y/n",
-            "/votekick [player]"
+            "[#FFFFFFFF]/discord[]",
+            "[#FFFFFFFF]/lb[]",
+            "[#FFFFFFFF]/maps[] [page]",
+            "[#FFFFFFFF]/rank[] [page]",
+            "[#FFFFFFFF]/rollback[] [name/index]",
+            "[#FFFFFFFF]/rtv[] [map]",
+            "[#FFFFFFFF]/snow[]",
+            "[#FFFFFFFF]/t[]",
+            "[#FFFFFFFF]/time[]",
+            "[#FFFFFFFF]/toggle[]",
+            "[#FFFFFFFF]/tr[] [language]/auto/off",
+            "[#FFFFFFFF]/upload[]",
+            "[#FFFFFFFF]/vote[] y/n",
+            "[#FFFFFFFF]/votekick[] [player]"
     );
 
-    private static boolean snowCommandUsed = false;
+    public SimplePlugin() {
+        Events.on(ServerLoadEvent.class, s -> {
+            load();
+            webInit();
+            loadTime();
+            loadRank();
+            showLeaderboard();
+            Timer.schedule(() -> {
+                if (!Vars.state.isGame()) {
+                    Config.desc.set("Welcome to Snow!");return;
+                }
+                Groups.player.each(p -> addTime(p.uuid(), 0.06f));
+                long duration = Time.timeSinceMillis(gameStartTime);
+                int seconds = (int) (duration / 1000);
+                int minutes = seconds / 60;
+                Config.desc.set("[#EDF4FCBB]Game started [#EDF4FCFF]" + minutes + "[] minutes ago.[]");
+            }, 0f, 5f);
+            try {
+                server = new MapUploadServer(globalModeName, globalPort);
+            } catch (Exception e) {
+                Log.err("Web server failed to start:", e);
+            }
+            Timer.schedule(() -> {
+                cleanUpExpiredTokens();
+                long duration = Time.timeSinceMillis(gameStartTime);
+                int seconds = (int) (duration / 1000);
+                int minutes = seconds / 60;
+                Fi file = Core.files.local("config/snapshots/autosave-" + minutes + "m.msav");
+                SaveIO.save(file);
+            }, 70f, 70f);
+
+            java.io.File folder = new java.io.File("config/snapshots");
+            if (folder.exists()) {
+                for (java.io.File file : Objects.requireNonNull(folder.listFiles((dir, name) -> name.startsWith("autosave-")))) {
+                    //noinspection ResultOfMethodCallIgnored
+                    file.delete();
+                }
+            }
+        });
+
+        Events.on(PlayerChatEvent.class, e -> {
+            Player sender = e.player;
+            String message = e.message;
+            if (currentMap != null && currentVote && (message.equals("y") || message.equals("yes")) && sender != initPlayer && !this.votes.contains(sender.uuid())) {
+                this.votes.add(sender.uuid());
+                int cur = this.votes.size();
+                int reqVotes = (int) Math.ceil(ratio * Groups.player.size());
+                Call.sendMessage("[#D1DBF2FF]" + sender.name + "[] voted to change the map. " + "[#D1DBF2FF]" + cur + "[] votes, [#D1DBF2FF]" + reqVotes + "[] required.[]");
+                int curVotes = this.votes.size();
+                if (curVotes >= reqVotes) {
+                    Call.sendMessage("[#D1DBF2FF]Vote passed! Map []" + currentMap.name() + " [#D1DBF2FF]will be loaded in 5 seconds...");
+                    Timer.schedule(() -> {
+                        currentMode = Vars.state.rules.mode();
+                        java.io.File folder = new java.io.File("config/snapshots");
+                        if (folder.exists()) {
+                            for (java.io.File file : Objects.requireNonNull(folder.listFiles((dir, name) -> name.startsWith("autosave-")))) {
+                                //noinspection ResultOfMethodCallIgnored
+                                file.delete();
+                            }
+                        }
+                        if (currentMap != null) {
+                            reloadWorld(() -> {
+                                Vars.state.map = currentMap;
+                                Vars.world.loadMap(currentMap);
+                                Vars.state.rules = currentMap.applyRules(currentMode);
+                                Vars.logic.play();
+                                currentVote = false;
+                                currentMap = null;
+                                resetGameState();
+                            });
+                            end.cancel();
+                        }
+                    }, 5f);
+                }
+            }
+            Groups.player.each(receiver -> {
+                if (receiver == sender) return;
+                String messageLower = message.trim().toLowerCase();
+                String lang = playerLang.get(receiver.uuid());
+                if (receiver.locale.equals(sender.locale())) {
+                    return;
+                }
+                if (messageLower.startsWith("/") || messageLower.equals("back") || messageLower.equals("y") || messageLower.equals("yes")) {
+                    return;
+                }
+                if (lang == null || lang.equals("off")) return;
+                translate(message, "auto", lang, translated -> {
+                    if (!translated.equals(message)) {
+                        receiver.sendMessage("[][gray]" + sender.name + ": " + translated + "[]");
+                    }
+                }, () -> localeAsyncOne("Translation failed!", receiver));
+            });
+
+        });
+
+        Events.on(PlayerLeave.class, e -> {
+            Player player = e.player;
+            if (player == null || player.uuid() == null) return;
+
+            String uuid = player.uuid();
+            String name = player.name != null ? player.name : "Unknown";
+
+            if (votes.contains(uuid)) {
+                votes.remove(uuid);
+                int cur = votes.size();
+                int req = (int) Math.ceil(ratio * Groups.player.size());
+                Call.sendMessage("[#D1DBF2DD]" + name + " left, " + cur + " votes, " + req + " required.[]");
+            }
+
+            if (Vars.state.rules != null && Vars.state.rules.mode() == Gamemode.pvp && player.team() != null) {
+                playerTeams.put(uuid, player.team());
+                Timer.schedule(() -> playerTeams.remove(uuid), 60f * 5, 0, 0);
+            }
+        });
+
+        Events.on(GameOverEvent.class, e -> {
+            resetGameState();
+            collectLeaderboardData();
+            if (e.winner != null &&
+                    e.winner != Team.derelict &&
+                    Vars.state.teams.get(e.winner).hasCore() &&
+                    Groups.player.count(p -> p.team() == e.winner) > 0) {
+                Seq<Player> winners = Groups.player.copy().select(p -> p.team() == e.winner);
+                int total = winners.size;
+                int score = Math.max(25, 40 - total / 4);
+                for (Player p : winners) {
+                    addRank(p.uuid(), score);
+                    p.sendMessage("[#D1DBF2DD]You got " + score + " points![]");
+                }
+                Call.sendMessage("[#D1DBF2DD][#" + e.winner.color.toString() + "]" + e.winner.name + "[] team wins![]");
+            }
+            java.io.File folder = new java.io.File("config/snapshots");
+            if (folder.exists()) {
+                for (java.io.File file : Objects.requireNonNull(folder.listFiles((dir, name) -> name.startsWith("autosave-")))) {
+                    //noinspection ResultOfMethodCallIgnored
+                    file.delete();
+                }
+            }
+        });
+
+        Events.on(PlayerJoin.class, e -> {
+            Player player = e.player;
+            if (player == null || player.con == null) return;
+
+            String name = player.name != null ? player.name : "";
+            String ip = player.con.address != null ? player.con.address : "unknown";
+            String playerUUID = player.uuid() != null ? player.uuid() : UUID.randomUUID().toString(); // fallback uuid
+
+            if (!isValidName(name)) {
+                String raw = "Your name is illegal or contains special characters or is longer than 40 characters.";
+                localeAsync(raw, player,
+                        translated -> {
+                            if (player.con != null) player.con.kick(translated);
+                        },
+                        () -> {
+                            if (player.con != null) player.con.kick(raw);
+                        }
+                );
+                return;
+            }
+
+            if (!playtimeData.containsKey(playerUUID)) {
+                updatePlaytime(playerUUID, 0f);
+            }
+
+            if (isNewIP(ip)) {
+                if (player.team() == null) {
+                    Log.warn("Cannot move player to derelict: player or team is null.");
+                    return;
+                }
+                lastTeams.put(playerUUID, player.team());
+                player.team(Team.derelict);
+                confirm(player);
+                Timer.Task task = Timer.schedule(() -> {
+                    Player p = Groups.player.find(pl -> pl.uuid().equals(playerUUID));
+                    if (p == null || p.con == null) return;
+                    if (playerUUID != null && !confirmedPlayers.contains(playerUUID)) {
+                        p.kick("Did not confirm within 1 minute.");
+                    } else confirmedPlayers.remove(playerUUID);
+                    confirmTasks.remove(playerUUID);
+                }, 60f);
+                confirmTasks.put(player.uuid(), task);
+            } else {
+                String motdRaw = "Welcome to snow!";
+                localeAsync(motdRaw, player, player::sendMessage, () -> player.sendMessage(motdRaw));
+                Team newTeam = playerTeams.get(playerUUID);
+                boolean isPVP = Vars.state.rules != null && Vars.state.rules.mode() == Gamemode.pvp;
+                Team playerTeam = player.team();
+                Teams.TeamData teamData = (Vars.state != null && Vars.state.teams != null) ? Vars.state.teams.get(playerTeam) : null;
+                Teams.TeamData newTeamData = (newTeam != null && Vars.state != null && Vars.state.teams != null)
+                        ? Vars.state.teams.get(newTeam)
+                        : null;
+                boolean teamHasCore = teamData != null && teamData.hasCore();
+                boolean hasLost = Boolean.TRUE.equals(lostTeam.get(playerUUID)); // null 或 false 均视为未败队
+                if (isPVP){
+                    if (hasLost) {
+                        localeAsyncOne("Your team has lost. Please wait for the next round.", player);
+                        player.team(Team.derelict);
+                    } else {
+                        if (newTeam != null && playerTeam != newTeam && newTeamData != null && newTeamData.hasCore()) {
+                            lastTeams.put(playerUUID, player.team());
+                            player.team(Team.derelict);
+                            playersReturn.add(playerUUID);
+                            welcome(player);
+                        } else if (!teamHasCore) {
+                            assignFallbackTeamIfNoCore(player);
+                        }
+                    }
+                }
+            }
+
+            if (!playerLang.containsKey(playerUUID)) {
+                String lang = player.locale;
+                String detectedLang = (lang == null || lang.isEmpty()) ? "en" : lang;
+                playerLang.put(playerUUID, detectedLang);
+            }
+
+            lbEnabled.add(player.uuid());
+        });
+
+        Events.on(BlockDestroyEvent.class, event -> {
+            var team = event.tile.team();
+
+            if (event.tile.block() instanceof CoreBlock) {
+                if (team != Team.derelict && team.cores().size <= 1) {
+                    team.data().players.each(p -> {
+                        if (Vars.state.rules.mode() == Gamemode.pvp) {
+                            localeAsyncOne("Your team has lost. Please wait for the next round.", p);
+                            int size = Math.max(1, team.data().players.size);
+                            int penalty = Math.max(20, 40 - size / 3);
+                            Integer oldValue = rankData.get(p.uuid());
+                            int old = oldValue != null ? oldValue : 0;
+                            int updated = Math.max(0, old - penalty);
+                            updateRankTime(p.uuid(), updated);
+                            p.sendMessage("[#D1DBF2FF]You lost " + penalty + " points[]!");
+                            lostTeam.put(p.uuid(), true);
+                            p.team(Team.derelict);
+                            p.clearUnit();
+                            collectLeaderboardData();
+                        } else {
+                            localeAsyncOne("You lost this game.", p);
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    private static final int menuId = Menus.registerMenu((player, choice) -> {
+        if (choice == 1) {
+            Team newTeam = playerTeams.get(player.uuid());
+            if (newTeam != null) player.team(newTeam);
+            lastTeams.remove(player.uuid());
+            playersReturn.remove(player.uuid());
+            playerTeams.remove(player.uuid());
+        } else if (choice == 0) {
+            if (!playersReturn.contains(player.uuid())) return;
+
+            playersReturn.remove(player.uuid());
+            playerTeams.remove(player.uuid());
+
+            Team lastTeam = lastTeams.remove(player.uuid());
+            boolean validLastTeam = lastTeam != null &&
+                    Vars.state.teams.get(lastTeam) != null &&
+                    Vars.state.teams.get(lastTeam).hasCore();
+
+            if (validLastTeam) {
+                player.team(lastTeam);
+            } else {
+                assignFallbackTeamIfNoCore(player);
+            }
+        }
+    });
+
     @Override
     public void registerClientCommands(CommandHandler handler) {
 
         handler.removeCommand("a");
         handler.<Player>register("help", "[page]", (args, player) -> {
-            StringBuilder helpMessage = new StringBuilder("[#D1DBF2FF]Available Commands:\n");
+            StringBuilder helpMessage = new StringBuilder("Available Commands:\n");
 
             for (String command : commands) {
                 helpMessage.append("[#D1DBF2FF]").append(command).append("\n");
             }
-            player.sendMessage(helpMessage.toString());
+            player.sendMessage(helpMessage.append("[]").toString());
         });
 
         handler.<Player>register("snow", "snow", (args, player) -> {
             if (snowCommandUsed) {
-                player.sendMessage("[#D1DBF2FF]The snow effect has already been applied in this match.");
+                player.sendMessage("[#D1DBF2FF]The snow effect has already been applied in this game.");
                 return;
             }
-            if (player.admin) {
+            String playerUUID = player.uuid();
+            int current = rankData.containsKey(playerUUID) ? rankData.get(playerUUID) : 0;
+            if (player.admin || current > 50) {
                 Vars.state.rules.ambientLight.set(new Color(0.1f, 0.1f, 0.2f, 0.8f));
                 Vars.state.rules.lighting = true;
                 Weather.WeatherEntry entry = new Weather.WeatherEntry();
@@ -683,7 +875,7 @@ Click "Confirm" to start.
                 }
                 snowCommandUsed = true;
             } else {
-                player.sendMessage("[#D1DBF2FF]You must be an admin.");
+                player.sendMessage("[#D1DBF2FF]You must be an admin or has 50+ points.");
             }
         });
 
@@ -765,8 +957,7 @@ Click "Confirm" to start.
                     SaveIO.load(new Fi(finalTargetFile));
                     Vars.state.set(GameState.State.playing);
                     netServer.openServer();
-                    currentVote = false;
-                    currentMap = null;
+                    resetGameState();
                 });
 
                 String displayName = finalTargetFile.getName().replace("autosave-", "").replace(".msav", "");
@@ -784,20 +975,25 @@ Click "Confirm" to start.
                 String token = TokenManager.generateToken();
                 int port = config.port;
                 String url = "http://" + globalUrl + ":" + port + "/?token=" + token;
-                player.sendMessage("[#D1DBF2FF]Upload link (valid 5 min): " + url + "[]");
+                player.sendMessage("[#FFFFFFFF]Upload link (valid 5 min): [][#D1DBF2FF]" + url + "[]");
                 Call.openURI(player.con, url);
             } else {
-                localeAsyncOne("You do not meet the map upload requirements! To upload a map, you must have at least 3000 points on this server or be an admin. Maps must be under 200x200 in size and appropriate for the current game mode.", player);
+                player.sendMessage("[#D1DBF2FF]You need 3000+ points or admin to upload maps. Max size: 200×200. Must fit current mode.");
             }
         });
 
+        handler.<Player>register("discord", "", (args, player) -> {
+            String url ="https://discord.gg/ajvwQMx8";
+            player.sendMessage("[#FFFFFFFF]Invite link: [][#D1DBF2FF]" + url + "[]");
+            Call.openURI(player.con, url);
+        });
 
-        handler.<Player>register("toggle", "Become admin if you have over 10000 points", (args, player) -> {
+        handler.<Player>register("toggle", "Admin status toggle", (args, player) -> {
             String playerUUID = player.uuid();
             int current = rankData.containsKey(playerUUID) ? rankData.get(playerUUID) : 0;
             boolean isApproved = approvedAdmins.getOrDefault(player.uuid(), false);
 
-            if (current > 10000 || isApproved || player.admin) {
+            if (current > 8000 || isApproved || player.admin) {
 
                 if (!player.admin) {
                     player.admin = true;
@@ -810,7 +1006,7 @@ Click "Confirm" to start.
                 }
 
             } else {
-                player.sendMessage("[#D1DBF2FF]You need at least 10000 points to become admin. Current: "
+                player.sendMessage("[#D1DBF2FF]You need at least 8000 points to become admin. Current: "
                         + String.format("%d", current) + "[]");
             }
         });
@@ -869,14 +1065,24 @@ Click "Confirm" to start.
             int startIndex = (page - 1) * mapsPerPage;
             int endIndex = Math.min(page * mapsPerPage, totalMaps);
 
-            StringBuilder mapList = new StringBuilder("[#D1DBF2FF]Current Map: []" + Vars.state.map.name() + "\n");
-            mapList.append("[]Available Maps (Page ").append(page).append("/").append(totalPages).append("):[]\n");
+            StringBuilder mapList = new StringBuilder("[#FFFFFFFF]Current Map: [][#D1DBF2FF]" + Vars.state.map.name() + "[]\n");
+            mapList.append("[#FFFFFFFF]Available Maps (Page ").append(page).append("/").append(totalPages).append("):[]\n");
 
             for (int i = startIndex; i < endIndex; i++) {
                 mapList.append("[#D1DBF2FF]").append(i + 1).append(". ").append(availableMaps.get(i).name()).append("[]\n");
             }
 
             player.sendMessage(mapList.toString());
+        });
+
+        handler.<Player>register("lb", "Toggle online leaderboard display.", (args, player) -> {
+            if (lbEnabled.contains(player.uuid())) {
+                lbEnabled.remove(player.uuid());
+                player.sendMessage("[#D1DBF2FF]Leaderboard display disabled.[]");
+            } else {
+                lbEnabled.add(player.uuid());
+                player.sendMessage("[#D1DBF2FF]Leaderboard display enabled.[]");
+            }
         });
 
         handler.<Player>register("rank", "[page]", "rankings", (args, player) -> {
@@ -890,8 +1096,9 @@ Click "Confirm" to start.
                 }
             }
 
-            Seq<String> uuids = rankData.keys().toSeq().select(id -> rankData.get(id, 0) > 0);
+            int myScore = rankData.get(player.uuid(), 0);
 
+            Seq<String> uuids = rankData.keys().toSeq().select(id -> rankData.get(id, 0) > 0);
             uuids.sort((a, b) -> Integer.compare(rankData.get(b, 0), rankData.get(a, 0)));
 
             int playersPerPage = 10;
@@ -908,26 +1115,25 @@ Click "Confirm" to start.
                 return;
             }
 
+            StringBuilder message = new StringBuilder();
+
+            if (myScore > 0) {
+                int myRank = uuids.indexOf(player.uuid()) + 1;
+                message.append("[#FFFFFFFF]Your Rank: [][#D1DBF2FF]").append(myRank).append("/").append(totalPlayers)
+                        .append(" | ").append(myScore).append(" []\n");
+            } else {
+                message.append("[#D1DBF2FF]You have no points yet.[]\n");
+            }
+            message.append("[#FFFFFFFF]Rankings (Page ").append(page).append("/").append(totalPages).append("):[]\n");
+
             int startIndex = (page - 1) * playersPerPage;
             int endIndex = Math.min(page * playersPerPage, totalPlayers);
-
-            StringBuilder message = new StringBuilder();
-            message.append("[#FFFFFFFF]Rankings (Page ").append(page).append("/").append(totalPages).append("):[]\n");
 
             for (int i = startIndex; i < endIndex; i++) {
                 String id = uuids.get(i);
                 String name = Vars.netServer.admins.getInfo(id) != null ? Vars.netServer.admins.getInfo(id).lastName : "<unknown>";
                 int score = rankData.get(id, 0);
                 message.append("[#D1DBF2FF]").append(i + 1).append(". ").append(name).append(" - ").append(score).append(" []\n");
-            }
-
-            int myScore = rankData.get(player.uuid(), 0);
-            int myRank = uuids.indexOf(player.uuid(), true) + 1;
-            if (myScore > 0) {
-                message.append("\n[#D1DBF2FF]Your Rank: ").append(myRank).append("/").append(totalPlayers)
-                        .append(" | ").append(myScore).append(" []");
-            } else {
-                message.append("\n[#84f491]You have no points yet.[]");
             }
 
             player.sendMessage(message.toString());
@@ -970,94 +1176,5 @@ Click "Confirm" to start.
                 }
             }
         });
-    }
-
-    public static void translate(String text, String from, String to, Cons<String> result, Runnable error) {
-        Http.post("https://clients5.google.com/translate_a/t?client=dict-chrome-ex&dt=t", "tl=" + to + "&sl=" + from + "&q=" + Strings.encode(text))
-                .error(throwable -> error.run())
-                .submit(response -> result.get(reader.parse(response.getResultAsString()).get(0).get(0).asString()));
-    }
-
-    public static void localeAsync(String message, Player player, Cons<String> onResult, Runnable onError) {
-        String playerLocale = player.locale != null ? player.locale : "en";
-        translate(message, "auto", playerLocale, onResult, onError);
-    }
-
-    public static void localeAsyncAll(String message) {
-        Groups.player.each(player -> localeAsync(message, player,
-                translated -> player.sendMessage("[#D1DBF2FF]" + translated + "[]"),
-                () -> player.sendMessage("[#D1DBF2FF]" + message + "[]")
-        ));
-    }
-
-    public static void localeAsyncOne(String message, Player player) {
-        localeAsync(message, player,
-                translated -> player.sendMessage("[#D1DBF2FF]" + translated + "[]"),
-                () -> player.sendMessage("[#D1DBF2FF]" + message + "[]")
-        );
-    }
-
-    private void startVote(Player initiator, Map map) {
-        if (currentVote) return;
-
-        this.currentVote = true;
-        this.currentMap = map;
-        this.initPlayer = initiator;
-        this.votes.add(initiator.uuid());
-        int cur = this.votes.size();
-        int req = (int) Math.ceil(ratio * Groups.player.size());
-
-        if (req == 1 || initPlayer.admin) {
-            lostTeam.clear();
-            this.votes.clear();
-            playerTeams.clear();
-            Call.sendMessage("[#D1DBF2FF]Vote passed. Map []" + currentMap.name() + " [#D1DBF2FF]will be loaded.[]");
-            currentMode = Vars.state.rules.mode();
-            gameStartTime = Time.millis();
-            java.io.File folder = new java.io.File("config/snapshots");
-            if (folder.exists()) {
-                for (java.io.File file : Objects.requireNonNull(folder.listFiles((dir, name) -> name.startsWith("autosave-")))) {
-                    //noinspection ResultOfMethodCallIgnored
-                    file.delete();
-                }
-            }
-
-            reloadWorld(() -> {
-                Vars.state.map = currentMap;
-                Vars.world.loadMap(currentMap);
-                Vars.state.rules = currentMap.applyRules(currentMode);
-                Vars.logic.play();
-                currentVote = false;
-                currentMap = null;
-            });
-            return;
-        } else {
-            Call.sendMessage("[#D1DBF2FF]" + initiator.name + "[][#D1DBF2FF] voted to change the map to []" + map.name() + "[#D1DBF2FF]. " + cur + " votes, " + req + " required." + "\n" + "Type y to vote.[]");
-        }
-
-
-        end = Timer.schedule(() -> {
-            if (currentVote) {
-                int curVotes = this.votes.size();
-                if (curVotes < req) {
-                    localeAsyncAll("Voted failed.");
-                    this.votes.clear();
-                    currentVote = false;
-                    currentMap = null;
-                }
-            }
-
-        }, 30f);
-    }
-
-    public static void reloadWorld(Runnable runnable) {
-        try {
-            WorldReloader reloader = new WorldReloader();
-            reloader.begin();
-            runnable.run();
-            reloader.end();
-        } catch (Exception e) {  // Catching general exception
-            Log.err("Error while reloading map: " + e.getMessage());
-        }
     }
 }
