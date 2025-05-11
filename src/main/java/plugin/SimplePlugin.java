@@ -78,7 +78,6 @@ public class SimplePlugin extends Plugin {
     private static final HashMap<String, Team> playerTeams = new HashMap<>();
     private final HashMap<String, String> playerLang = new HashMap<>();
     private final HashMap<String, Boolean> approvedAdmins = new HashMap<>();
-    private final static HashSet<String> confirmedPlayers = new HashSet<>();
     private final HashMap<String, Boolean> lostTeam = new HashMap<>();
     private static final HashMap<String, String> languageMapping = new HashMap<String, String>() {{
         put("zh", "中文");
@@ -96,14 +95,15 @@ public class SimplePlugin extends Plugin {
         currentMap = null;
         currentMode = null;
         initPlayer = null;
-        gameStartTime = Time.millis();
+        snowCommandUsed = false;
         votes.clear();
         lastTeams.clear();
         playersReturn.clear();
         playerTeams.clear();
         lostTeam.clear();
-        end.cancel();
-        this.votes.clear();
+        if (end != null) {
+            end.cancel();
+        }
     }
 
     public static void loadTime() {
@@ -280,10 +280,11 @@ public class SimplePlugin extends Plugin {
             }
         }
     }
+
     public void collectLeaderboardData() {
         Seq<Player> onlineWithScore = Groups.player.copy().select(p -> rankData.get(p.uuid(), 0) > 0);
         updatedBuilder.setLength(0);
-        updatedBuilder.append("[#FFFFFF]Leaderboard (Online):[]\n");
+        updatedBuilder.append("[#FFFFFF]Leaderboard[]\n");
 
         if (!onlineWithScore.isEmpty()) {
             onlineWithScore.sort((a, b) -> Integer.compare(rankData.get(b.uuid(), 0), rankData.get(a.uuid(), 0)));
@@ -291,7 +292,7 @@ public class SimplePlugin extends Plugin {
                 Player p = onlineWithScore.get(i);
                 int score = rankData.get(p.uuid(), 0);
                 updatedBuilder.append("[#D1DBF2FF]").append(i + 1).append(". ")
-                        .append(p.name).append(" - ")
+                        .append(p.name).append(": ")
                         .append(score).append("[]\n");
             }
         }
@@ -299,9 +300,11 @@ public class SimplePlugin extends Plugin {
 
     public void showLeaderboard() {
         Timer.schedule(() -> {
-            if (Groups.player.isEmpty()) return;
+            collectLeaderboardData();
             Groups.player.each(player -> {
+                if (player == null || player.con == null) return;
                 if (!lbEnabled.contains(player.uuid())) return;
+                if (updatedBuilder.isEmpty()) return;
                 Call.infoPopup(player.con, updatedBuilder.toString(), 5f, 8, 0, 2, 50, 0);
             });
         }, 0f, 5f);
@@ -358,24 +361,22 @@ public class SimplePlugin extends Plugin {
                 Vars.state.rules = currentMap.applyRules(currentMode);
                 Vars.logic.play();
                 resetGameState();
+                gameStartTime = Time.millis();
             });
-            return;
         } else {
-            Call.sendMessage("[#FFFFFFFF]" + initiator.name + "[][#D1DBF2FF] voted to change the map to []" + map.name() + "[#FFFFFFFF]. " + cur + "[][#D1DBF2FF] votes, [][#FFFFFFFF]" + req + "[][#D1DBF2FF] required." + "\n" + "Type[] [#FFFFFFFF]y[] [#D1DBF2FF]to vote.[]");
-        }
-
-        end = Timer.schedule(() -> {
-            if (currentVote) {
-                int curVotes = this.votes.size();
-                if (curVotes < req) {
-                    localeAsyncAll("Voted failed.");
-                    this.votes.clear();
-                    currentVote = false;
-                    currentMap = null;
+            end = Timer.schedule(() -> {
+                if (currentVote) {
+                    int curVotes = this.votes.size();
+                    if (curVotes < req) {
+                        localeAsyncAll("Voted failed.");
+                        this.votes.clear();
+                        currentVote = false;
+                        currentMap = null;
+                    }
                 }
-            }
-
-        }, 30f);
+            }, 30f);
+            Call.sendMessage("[#FFFFFFFF]" + initiator.name + "[][#D1DBF2FF] voted to change the map to [][#FFFFFFFF]" + map.name() + "[][#FFFFFFFF]. " + cur + "[][#D1DBF2FF] votes, [][#FFFFFFFF]" + req + "[][#D1DBF2FF] required." + "\n" + "Type[] [#FFFFFFFF]y[] [#D1DBF2FF]to vote.[]");
+        }
     }
 
     public static void reloadWorld(Runnable runnable) {
@@ -429,7 +430,6 @@ public class SimplePlugin extends Plugin {
     private static final int playerMenuId = Menus.registerMenu((player, choice) -> {
         if (choice == 1) {
             String playerUUID = player.uuid();
-            confirmedPlayers.add(playerUUID);
             Team lastTeam = lastTeams.remove(player.uuid());
             boolean validLastTeam = lastTeam != null &&
                     Vars.state.teams.get(lastTeam) != null &&
@@ -550,7 +550,7 @@ Click "Confirm" to start.
     }
 
     private static final List<String> commands = Arrays.asList(
-            "[#FFFFFFFF]/discord[]",
+
             "[#FFFFFFFF]/lb[]",
             "[#FFFFFFFF]/maps[] [page]",
             "[#FFFFFFFF]/rank[] [page]",
@@ -613,7 +613,7 @@ Click "Confirm" to start.
                 this.votes.add(sender.uuid());
                 int cur = this.votes.size();
                 int reqVotes = (int) Math.ceil(ratio * Groups.player.size());
-                Call.sendMessage("[#D1DBF2FF]" + sender.name + "[] voted to change the map. " + "[#D1DBF2FF]" + cur + "[] votes, [#D1DBF2FF]" + reqVotes + "[] required.[]");
+                Call.sendMessage("[#FFFFFFFF]" + sender.name + "[][#D1DBF2FF] voted to change the map. []" + "[#FFFFFFFF]" + cur + "[][#D1DBF2FF] votes, [][#FFFFFFFF]" + reqVotes + "[][#D1DBF2FF] required.[]");
                 int curVotes = this.votes.size();
                 if (curVotes >= reqVotes) {
                     Call.sendMessage("[#D1DBF2FF]Vote passed! Map []" + currentMap.name() + " [#D1DBF2FF]will be loaded in 5 seconds...");
@@ -635,8 +635,11 @@ Click "Confirm" to start.
                                 currentVote = false;
                                 currentMap = null;
                                 resetGameState();
+                                gameStartTime = Time.millis();
                             });
-                            end.cancel();
+                            if (end != null) {
+                                end.cancel();  // Only cancel if the task is non-null
+                            }
                         }
                     }, 5f);
                 }
@@ -675,7 +678,10 @@ Click "Confirm" to start.
                 Call.sendMessage("[#D1DBF2DD]" + name + " left, " + cur + " votes, " + req + " required.[]");
             }
 
-            if (Vars.state.rules != null && Vars.state.rules.mode() == Gamemode.pvp && player.team() != null) {
+            if (Vars.state.rules != null
+                    && Vars.state.rules.mode() == Gamemode.pvp
+                    && player.team() != null
+                    && player.team() != Team.derelict) {
                 playerTeams.put(uuid, player.team());
                 Timer.schedule(() -> playerTeams.remove(uuid), 60f * 5, 0, 0);
             }
@@ -683,7 +689,7 @@ Click "Confirm" to start.
 
         Events.on(GameOverEvent.class, e -> {
             resetGameState();
-            collectLeaderboardData();
+            gameStartTime = Time.millis();
             if (e.winner != null &&
                     e.winner != Team.derelict &&
                     Vars.state.teams.get(e.winner).hasCore() &&
@@ -709,7 +715,6 @@ Click "Confirm" to start.
         Events.on(PlayerJoin.class, e -> {
             Player player = e.player;
             if (player == null || player.con == null) return;
-
             String name = player.name != null ? player.name : "";
             String ip = player.con.address != null ? player.con.address : "unknown";
             String playerUUID = player.uuid() != null ? player.uuid() : UUID.randomUUID().toString(); // fallback uuid
@@ -742,14 +747,14 @@ Click "Confirm" to start.
                 Timer.Task task = Timer.schedule(() -> {
                     Player p = Groups.player.find(pl -> pl.uuid().equals(playerUUID));
                     if (p == null || p.con == null) return;
-                    if (playerUUID != null && !confirmedPlayers.contains(playerUUID)) {
+                    if (playerUUID != null) {
                         p.kick("Did not confirm within 1 minute.");
-                    } else confirmedPlayers.remove(playerUUID);
+                    }
                     confirmTasks.remove(playerUUID);
                 }, 60f);
                 confirmTasks.put(player.uuid(), task);
             } else {
-                String motdRaw = "Welcome to snow!";
+                String motdRaw = "Welcome to Snow!";
                 localeAsync(motdRaw, player, player::sendMessage, () -> player.sendMessage(motdRaw));
                 Team newTeam = playerTeams.get(playerUUID);
                 boolean isPVP = Vars.state.rules != null && Vars.state.rules.mode() == Gamemode.pvp;
@@ -804,7 +809,6 @@ Click "Confirm" to start.
                             lostTeam.put(p.uuid(), true);
                             p.team(Team.derelict);
                             p.clearUnit();
-                            collectLeaderboardData();
                         } else {
                             localeAsyncOne("You lost this game.", p);
                         }
@@ -823,7 +827,6 @@ Click "Confirm" to start.
             playerTeams.remove(player.uuid());
         } else if (choice == 0) {
             if (!playersReturn.contains(player.uuid())) return;
-
             playersReturn.remove(player.uuid());
             playerTeams.remove(player.uuid());
 
@@ -971,14 +974,14 @@ Click "Confirm" to start.
         handler.<Player>register("upload", "", (args, player) -> {
             String playerUUID = player.uuid();
             int current = rankData.containsKey(playerUUID) ? rankData.get(playerUUID) : 0;
-            if (current > 3000 || player.admin) {
+            if (current > 300 || player.admin) {
                 String token = TokenManager.generateToken();
                 int port = config.port;
                 String url = "http://" + globalUrl + ":" + port + "/?token=" + token;
                 player.sendMessage("[#FFFFFFFF]Upload link (valid 5 min): [][#D1DBF2FF]" + url + "[]");
                 Call.openURI(player.con, url);
             } else {
-                player.sendMessage("[#D1DBF2FF]You need 3000+ points or admin to upload maps. Max size: 200×200. Must fit current mode.");
+                player.sendMessage("[#D1DBF2FF]You need 300+ points or admin to upload maps. Max size: 200×200. Must fit current mode.");
             }
         });
 
@@ -993,7 +996,7 @@ Click "Confirm" to start.
             int current = rankData.containsKey(playerUUID) ? rankData.get(playerUUID) : 0;
             boolean isApproved = approvedAdmins.getOrDefault(player.uuid(), false);
 
-            if (current > 8000 || isApproved || player.admin) {
+            if (current > 5000 || isApproved || player.admin) {
 
                 if (!player.admin) {
                     player.admin = true;
@@ -1006,7 +1009,7 @@ Click "Confirm" to start.
                 }
 
             } else {
-                player.sendMessage("[#D1DBF2FF]You need at least 8000 points to become admin. Current: "
+                player.sendMessage("[#D1DBF2FF]You need at least 5000 points to become admin. Current: "
                         + String.format("%d", current) + "[]");
             }
         });
@@ -1075,7 +1078,7 @@ Click "Confirm" to start.
             player.sendMessage(mapList.toString());
         });
 
-        handler.<Player>register("lb", "Toggle online leaderboard display.", (args, player) -> {
+        handler.<Player>register("lb", "Toggle leaderboard display.", (args, player) -> {
             if (lbEnabled.contains(player.uuid())) {
                 lbEnabled.remove(player.uuid());
                 player.sendMessage("[#D1DBF2FF]Leaderboard display disabled.[]");
@@ -1133,7 +1136,7 @@ Click "Confirm" to start.
                 String id = uuids.get(i);
                 String name = Vars.netServer.admins.getInfo(id) != null ? Vars.netServer.admins.getInfo(id).lastName : "<unknown>";
                 int score = rankData.get(id, 0);
-                message.append("[#D1DBF2FF]").append(i + 1).append(". ").append(name).append(" - ").append(score).append(" []\n");
+                message.append("[#D1DBF2FF]").append(i + 1).append(". ").append(name).append(": ").append(score).append(" []\n");
             }
 
             player.sendMessage(message.toString());
