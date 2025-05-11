@@ -2,8 +2,10 @@ package plugin;
 
 import arc.Events;
 import arc.graphics.Color;
+import arc.math.Mathf;
 import arc.util.CommandHandler;
 import mindustry.Vars;
+import mindustry.content.Fx;
 import mindustry.core.GameState;
 import mindustry.game.EventType.*;
 import mindustry.game.Gamemode;
@@ -28,7 +30,6 @@ import mindustry.type.Weather;
 import mindustry.ui.Menus;
 import mindustry.world.blocks.storage.CoreBlock;
 import mindustry.content.Weathers;
-
 import java.util.HashMap;
 import java.util.*;
 import java.util.Arrays;
@@ -53,19 +54,21 @@ public class SimplePlugin extends Plugin {
     public static String globalModeName;
     public static String globalUrl;
     public static ServerConfig config = new ServerConfig();
-    public Timer.Task end;
     public static final JsonReader reader = new JsonReader();
+    private static boolean voteInProgress = false;
+    private static boolean kickVote = false;
+    private static Player voteInitiator = null;
+    private static Map targetMap = null;
+    private static Player targetPlayer = null;
+    private static final Seq<String> votes = new Seq<>();
+    private static Timer.Task voteTimer = null;
+    private static final float voteDuration = 30f;
     private final HashSet<String> lbEnabled = new HashSet<>();
     private final StringBuilder updatedBuilder = new StringBuilder(); // Store leaderboard data here
     private static final double ratio = 0.6;
-    private boolean currentVote = false;
-    private Map currentMap = null;
     private static final ObjectMap<String, Timer.Task> confirmTasks = new ObjectMap<>();
-    private Gamemode currentMode = null;
-    private Player initPlayer = null;
     private long gameStartTime = Time.millis();
     private static boolean snowCommandUsed = false;
-    private final HashSet<String> votes = new HashSet<>();
     private static final Set<String> knownIPs = new HashSet<>();
     private static final Fi ipFile = Vars.saveDirectory.child("ip-list.json");
     private static final Json json = new Json();
@@ -74,7 +77,6 @@ public class SimplePlugin extends Plugin {
     private static final ObjectMap<String, Float> playtimeData = new ObjectMap<>();
     private static final ObjectMap<String, Integer> rankData = new ObjectMap<>();
     private static final HashMap<String, Team> lastTeams = new HashMap<>();
-    private static final HashSet<String> playersReturn = new HashSet<>();
     private static final HashMap<String, Team> playerTeams = new HashMap<>();
     private final HashMap<String, String> playerLang = new HashMap<>();
     private final HashMap<String, Boolean> approvedAdmins = new HashMap<>();
@@ -91,18 +93,19 @@ public class SimplePlugin extends Plugin {
         put("tr", "Türkçe");
     }};
     public void resetGameState() {
-        currentVote = false;
-        currentMap = null;
-        currentMode = null;
-        initPlayer = null;
         snowCommandUsed = false;
         votes.clear();
         lastTeams.clear();
-        playersReturn.clear();
         playerTeams.clear();
         lostTeam.clear();
-        if (end != null) {
-            end.cancel();
+        voteInProgress = false;
+        kickVote = false;
+        voteInitiator = null;
+        targetMap = null;
+        targetPlayer = null;
+        if (voteTimer != null) {
+            voteTimer.cancel();
+            voteTimer = null;
         }
     }
 
@@ -122,7 +125,6 @@ public class SimplePlugin extends Plugin {
             }
         }
     }
-
 
     public static void saveTime() {
         try {
@@ -284,7 +286,7 @@ public class SimplePlugin extends Plugin {
     public void collectLeaderboardData() {
         Seq<Player> onlineWithScore = Groups.player.copy().select(p -> rankData.get(p.uuid(), 0) > 0);
         updatedBuilder.setLength(0);
-        updatedBuilder.append("[#FFFFFF]Leaderboard[]\n");
+        updatedBuilder.append("[#FFFFFF]Leaderboard[]\n\n");
 
         if (!onlineWithScore.isEmpty()) {
             onlineWithScore.sort((a, b) -> Integer.compare(rankData.get(b.uuid(), 0), rankData.get(a.uuid(), 0)));
@@ -321,62 +323,11 @@ public class SimplePlugin extends Plugin {
         translate(message, "auto", playerLocale, onResult, onError);
     }
 
-    public static void localeAsyncAll(String message) {
-        Groups.player.each(player -> localeAsync(message, player,
-                translated -> player.sendMessage("[#D1DBF2FF]" + translated + "[]"),
-                () -> player.sendMessage("[#D1DBF2FF]" + message + "[]")
-        ));
-    }
-
     public static void localeAsyncOne(String message, Player player) {
         localeAsync(message, player,
                 translated -> player.sendMessage("[#D1DBF2FF]" + translated + "[]"),
                 () -> player.sendMessage("[#D1DBF2FF]" + message + "[]")
         );
-    }
-
-    private void startVote(Player initiator, Map map) {
-        if (currentVote) return;
-        this.currentVote = true;
-        this.currentMap = map;
-        this.initPlayer = initiator;
-        this.votes.add(initiator.uuid());
-        int cur = this.votes.size();
-        int req = (int) Math.ceil(ratio * Groups.player.size());
-
-        if (req == 1 || initPlayer.admin) {
-            Call.sendMessage("[#D1DBF2FF]Vote passed. Map []" + currentMap.name() + " [#D1DBF2FF]will be loaded.[]");
-            currentMode = Vars.state.rules.mode();
-            java.io.File folder = new java.io.File("config/snapshots");
-            if (folder.exists()) {
-                for (java.io.File file : Objects.requireNonNull(folder.listFiles((dir, name) -> name.startsWith("autosave-")))) {
-                    //noinspection ResultOfMethodCallIgnored
-                    file.delete();
-                }
-            }
-
-            reloadWorld(() -> {
-                Vars.state.map = currentMap;
-                Vars.world.loadMap(currentMap);
-                Vars.state.rules = currentMap.applyRules(currentMode);
-                Vars.logic.play();
-                resetGameState();
-                gameStartTime = Time.millis();
-            });
-        } else {
-            end = Timer.schedule(() -> {
-                if (currentVote) {
-                    int curVotes = this.votes.size();
-                    if (curVotes < req) {
-                        localeAsyncAll("Voted failed.");
-                        this.votes.clear();
-                        currentVote = false;
-                        currentMap = null;
-                    }
-                }
-            }, 30f);
-            Call.sendMessage("[#FFFFFFFF]" + initiator.name + "[][#D1DBF2FF] voted to change the map to [][#FFFFFFFF]" + map.name() + "[][#FFFFFFFF]. " + cur + "[][#D1DBF2FF] votes, [][#FFFFFFFF]" + req + "[][#D1DBF2FF] required." + "\n" + "Type[] [#FFFFFFFF]y[] [#D1DBF2FF]to vote.[]");
-        }
     }
 
     public static void reloadWorld(Runnable runnable) {
@@ -390,42 +341,27 @@ public class SimplePlugin extends Plugin {
         }
     }
 
-    public static void welcome(Player player) {
-        String titleRaw = "Welcome back";
-        String content = "Return to your previous game team?";
-        String[] options = new String[]{"Cancel", "Confirm"};
+    private static final int menuId = Menus.registerMenu((player, choice) -> {
+        if (choice == 1) {
+            Team newTeam = playerTeams.get(player.uuid());
+            if (newTeam != null) player.team(newTeam);
+            lastTeams.remove(player.uuid());
+            playerTeams.remove(player.uuid());
+        } else if (choice == 0) {
+            playerTeams.remove(player.uuid());
 
-        translate(titleRaw, "auto", player.locale, translatedTitle -> {
-            String title = translatedTitle.equals(titleRaw) ? titleRaw : translatedTitle;
-            translate(content, "auto", player.locale, translatedContent -> {
-                String contentText = translatedContent.equals(content) ? content : translatedContent;
-                translate(options[0], "auto", player.locale, translatedOption1 -> {
-                    String option1 = translatedOption1.equals(options[0]) ? options[0] : translatedOption1;
-                    translate(options[1], "auto", player.locale, translatedOption2 -> {
-                        String option2 = translatedOption2.equals(options[1]) ? options[1] : translatedOption2;
-                        String[][] translatedOptions = new String[][]{
-                                {option1, option2}
-                        };
-                        Call.menu(player.con, menuId, title, contentText, translatedOptions);
-                    }, () -> {
-                        String option2 = options[1];
-                        String[][] translatedOptions = new String[][]{{option1, option2}};
-                        Call.menu(player.con, menuId, title, contentText, translatedOptions);
-                    });
-                }, () -> {
-                    String option1 = options[0];
-                    String[][] translatedOptions = new String[][]{{option1, options[1]}};
-                    Call.menu(player.con, menuId, title, contentText, translatedOptions);
-                });
-            }, () -> {
-                String[][] translatedOptions = new String[][]{{options[0], options[1]}};
-                Call.menu(player.con, menuId, title, content, translatedOptions);
-            });
-        }, () -> {
-            String[][] translatedOptions = new String[][]{{options[0], options[1]}};
-            Call.menu(player.con, menuId, titleRaw, content, translatedOptions);
-        });
-    }
+            Team lastTeam = lastTeams.remove(player.uuid());
+            boolean validLastTeam = lastTeam != null &&
+                    Vars.state.teams.get(lastTeam) != null &&
+                    Vars.state.teams.get(lastTeam).hasCore();
+
+            if (validLastTeam) {
+                player.team(lastTeam);
+            } else {
+                assignFallbackTeamIfNoCore(player);
+            }
+        }
+    });
 
     private static final int playerMenuId = Menus.registerMenu((player, choice) -> {
         if (choice == 1) {
@@ -453,46 +389,58 @@ public class SimplePlugin extends Plugin {
             player.con.kick();
         }
     });
-
-
+    private static void showTranslatedMenu(Player player, int menuId, String titleRaw, String contentRaw, String[] options) {
+        translate(titleRaw, "auto", player.locale, title -> translate(contentRaw, "auto", player.locale, content -> translate(options[0], "auto", player.locale, opt0 -> translate(options[1], "auto", player.locale, opt1 -> {
+            String[][] opts = {{opt0, opt1}};
+            Call.menu(player.con, menuId,
+                    title.equals(titleRaw) ? titleRaw : title,
+                    content.equals(contentRaw) ? contentRaw : content,
+                    opts);
+        }, () -> Call.menu(player.con, menuId, titleRaw, contentRaw, new String[][]{{opt0, options[1]}})), () -> Call.menu(player.con, menuId, titleRaw, contentRaw, new String[][]{{options[0], options[1]}})), () -> Call.menu(player.con, menuId, titleRaw, contentRaw, new String[][]{{options[0], options[1]}})), () -> Call.menu(player.con, menuId, titleRaw, contentRaw, new String[][]{{options[0], options[1]}}));
+    }
+    public static void welcome(Player player) {
+        showTranslatedMenu(player, menuId, "Welcome back", "Return to your previous game team?", new String[]{"Cancel", "Confirm"});
+    }
     public static void confirm(Player player) {
-        String titleRaw = "Welcome to Snow";
-        String content =
-                """
-Click "Confirm" to start.
-                """;
+        showTranslatedMenu(player, playerMenuId, "Welcome to Snow", "Click \"Confirm\" to start.", new String[]{"Cancel", "Confirm"});
+    }
 
-        String[] options = new String[]{"Cancel", "Confirm"};
-        translate(titleRaw, "auto", player.locale, translatedTitle -> {
-            String title = translatedTitle.equals(titleRaw) ? titleRaw : translatedTitle;
-            translate(content, "auto", player.locale, translatedContent -> {
-                String contentText = translatedContent.equals(content) ? content : translatedContent;
-                translate(options[0], "auto", player.locale, translatedOption1 -> {
-                    String option1 = translatedOption1.equals(options[0]) ? options[0] : translatedOption1;
+    private static void beginVote(Player initiator, boolean isKick, Map map, Player target) {
+        voteInProgress = true;
+        voteInitiator = initiator;
+        kickVote = isKick;
+        targetMap = map;
+        targetPlayer = target;
+        votes.clear();
+        votes.add(initiator.uuid());
+        int req = (int)Math.ceil(Groups.player.size() * ratio);
+        String message = isKick
+                ? "[#FFFFFFFF]" + initiator.name + "[][#D1DBF2FF] started a vote to kick [#FFFFFFFF]" + target.name + "[][#D1DBF2FF]. [white](1/" + req + ")[]\nType [#FFFFFFFF]y[] [#D1DBF2FF]to vote.[]"
+                : "[#FFFFFFFF]" + initiator.name + "[][#D1DBF2FF] started a vote to change the map to [#FFFFFFFF]" + map.name() + "[][#D1DBF2FF]. [white](1/" + req + ")[]\nType [#FFFFFFFF]y[] [#D1DBF2FF]to vote.[]";
+        Call.sendMessage(message);
+        voteTimer = Timer.schedule(SimplePlugin::endVote, voteDuration);
+    }
 
-                    translate(options[1], "auto", player.locale, translatedOption2 -> {
-                        String option2 = translatedOption2.equals(options[1]) ? options[1] : translatedOption2;
-                        String[][] translatedOptions = new String[][]{
-                                {option1, option2}
-                        };
-                        Call.menu(player.con, playerMenuId, title, contentText, translatedOptions);
-                    }, () -> {
-                        String option2 = options[1];
-                        String[][] translatedOptions = new String[][]{{option1, option2}};
-                        Call.menu(player.con, playerMenuId, title, contentText, translatedOptions);
-                    });
-                }, () -> {
-                    String option1 = options[0];
-                    String[][] translatedOptions = new String[][]{{option1, options[1]}};
-                    Call.menu(player.con, playerMenuId, title, contentText, translatedOptions);
-                });
-            }, () -> {
-                String[][] translatedOptions = new String[][]{{options[0], options[1]}};
-                Call.menu(player.con, playerMenuId, title, content, translatedOptions);
-            });
-        }, () -> {
-            String[][] translatedOptions = new String[][]{{options[0], options[1]}};
-            Call.menu(player.con, playerMenuId, titleRaw, content, translatedOptions);
+    private static void endVote() {
+        voteInProgress = false;
+        kickVote = false;
+        voteInitiator = null;
+        targetMap = null;
+        targetPlayer = null;
+        votes.clear();
+        if (voteTimer != null) {
+            voteTimer.cancel();
+            voteTimer = null;
+        }
+    }
+
+    private static void loadMap(Map map) {
+        reloadWorld(() -> {
+            Gamemode mode = Vars.state.rules.mode();
+            Vars.state.map = map;
+            Vars.world.loadMap(map);
+            Vars.state.rules = map.applyRules(mode);
+            Vars.logic.play();
         });
     }
 
@@ -549,22 +497,9 @@ Click "Confirm" to start.
                         block == Character.UnicodeBlock.CYRILLIC_EXTENDED_B;
     }
 
-    private static final List<String> commands = Arrays.asList(
-
-            "[#FFFFFFFF]/lb[]",
-            "[#FFFFFFFF]/maps[] [page]",
-            "[#FFFFFFFF]/rank[] [page]",
-            "[#FFFFFFFF]/rollback[] [name/index]",
-            "[#FFFFFFFF]/rtv[] [map]",
-            "[#FFFFFFFF]/snow[]",
-            "[#FFFFFFFF]/t[]",
-            "[#FFFFFFFF]/time[]",
-            "[#FFFFFFFF]/toggle[]",
-            "[#FFFFFFFF]/tr[] [language]/auto/off",
-            "[#FFFFFFFF]/upload[]",
-            "[#FFFFFFFF]/vote[] y/n",
-            "[#FFFFFFFF]/votekick[] [player]"
-    );
+    private boolean isYes(String message) {
+        return "y".equals(message) || "yes".equals(message);
+    }
 
     public SimplePlugin() {
         Events.on(ServerLoadEvent.class, s -> {
@@ -608,73 +543,59 @@ Click "Confirm" to start.
 
         Events.on(PlayerChatEvent.class, e -> {
             Player sender = e.player;
-            String message = e.message;
-            if (currentMap != null && currentVote && (message.equals("y") || message.equals("yes")) && sender != initPlayer && !this.votes.contains(sender.uuid())) {
-                this.votes.add(sender.uuid());
-                int cur = this.votes.size();
-                int reqVotes = (int) Math.ceil(ratio * Groups.player.size());
-                Call.sendMessage("[#FFFFFFFF]" + sender.name + "[][#D1DBF2FF] voted to change the map. []" + "[#FFFFFFFF]" + cur + "[][#D1DBF2FF] votes, [][#FFFFFFFF]" + reqVotes + "[][#D1DBF2FF] required.[]");
-                int curVotes = this.votes.size();
-                if (curVotes >= reqVotes) {
-                    Call.sendMessage("[#D1DBF2FF]Vote passed! Map []" + currentMap.name() + " [#D1DBF2FF]will be loaded in 5 seconds...");
-                    Timer.schedule(() -> {
-                        currentMode = Vars.state.rules.mode();
-                        java.io.File folder = new java.io.File("config/snapshots");
-                        if (folder.exists()) {
-                            for (java.io.File file : Objects.requireNonNull(folder.listFiles((dir, name) -> name.startsWith("autosave-")))) {
-                                //noinspection ResultOfMethodCallIgnored
-                                file.delete();
-                            }
+            String rawMessage = e.message;
+            if (rawMessage == null) return;
+            String lowerMessage = rawMessage.trim().toLowerCase();
+            if (rawMessage.startsWith("/") || isYes(lowerMessage)) {
+                if (voteInProgress && isYes(lowerMessage) && sender != voteInitiator && !votes.contains(sender.uuid())) {
+                    votes.add(sender.uuid());
+                    int currentVotes = votes.size;
+                    int required = (int) Math.ceil(Groups.player.size() * ratio);
+                    if (kickVote && targetPlayer != null) {
+                        Call.sendMessage("[#D1DBF2FF]" + sender.name + " voted to kick " + targetPlayer.name + ". [white](" + currentVotes + "/" + required + ")[]");
+                        if (currentVotes >= required) {
+                            Call.sendMessage("[#D1DBF2FF]Vote passed. Kicking " + targetPlayer.name + ".[]");
+                            targetPlayer.kick("[#D1DBF2FF]You were kicked by vote.[]");
+                            endVote();
                         }
-                        if (currentMap != null) {
-                            reloadWorld(() -> {
-                                Vars.state.map = currentMap;
-                                Vars.world.loadMap(currentMap);
-                                Vars.state.rules = currentMap.applyRules(currentMode);
-                                Vars.logic.play();
-                                currentVote = false;
-                                currentMap = null;
-                                resetGameState();
-                                gameStartTime = Time.millis();
-                            });
-                            if (end != null) {
-                                end.cancel();  // Only cancel if the task is non-null
-                            }
+                    } else if (!kickVote && targetMap != null) {
+                        Call.sendMessage("[#FFFFFFFF]" + sender.name + "[][#D1DBF2FF] voted to change the map to [][#FFFFFFFF]" + targetMap.name() + "[][#FFFFFFFF]. " + currentVotes + "[][#D1DBF2FF] votes, [][#FFFFFFFF]" + required + "[][#D1DBF2FF] required." + "\n" + "Type[] [#FFFFFFFF]y[] [#D1DBF2FF]to vote.");
+                        if (currentVotes >= required) {
+                            Call.sendMessage("[#D1DBF2FF]Vote passed. Loading map " + targetMap.name() + ".[]");
+                            loadMap(targetMap);
+                            endVote();
+                            resetGameState();
                         }
-                    }, 5f);
-                }
-            }
-            Groups.player.each(receiver -> {
-                if (receiver == sender) return;
-                String messageLower = message.trim().toLowerCase();
-                String lang = playerLang.get(receiver.uuid());
-                if (receiver.locale.equals(sender.locale())) {
-                    return;
-                }
-                if (messageLower.startsWith("/") || messageLower.equals("back") || messageLower.equals("y") || messageLower.equals("yes")) {
-                    return;
-                }
-                if (lang == null || lang.equals("off")) return;
-                translate(message, "auto", lang, translated -> {
-                    if (!translated.equals(message)) {
-                        receiver.sendMessage("[][gray]" + sender.name + ": " + translated + "[]");
                     }
-                }, () -> localeAsyncOne("Translation failed!", receiver));
-            });
+                }
+            } else {
+                Groups.player.each(receiver -> {
+                    if (receiver == null || receiver == sender) return;
 
+                    String lang = playerLang.get(receiver.uuid());
+                    if (lang == null || "off".equals(lang)) return;
+                    if (receiver.locale.equals(sender.locale())) {
+                        return;
+                    }
+                    translate(rawMessage, "auto", lang, translated -> {
+                        if (!translated.equals(rawMessage)) {
+                            receiver.sendMessage("[#EDF4FCBB]" + sender.name + ": " + translated + "[]");
+                        }
+                    }, () -> localeAsyncOne("Translation failed!", receiver));
+                });
+            }
         });
 
         Events.on(PlayerLeave.class, e -> {
             Player player = e.player;
             if (player == null || player.uuid() == null) return;
-
             String uuid = player.uuid();
             String name = player.name != null ? player.name : "Unknown";
 
             if (votes.contains(uuid)) {
                 votes.remove(uuid);
-                int cur = votes.size();
-                int req = (int) Math.ceil(ratio * Groups.player.size());
+                int cur = votes.size;
+                int req = (int) Math.ceil(Groups.player.size() * ratio);
                 Call.sendMessage("[#D1DBF2DD]" + name + " left, " + cur + " votes, " + req + " required.[]");
             }
 
@@ -773,7 +694,6 @@ Click "Confirm" to start.
                         if (newTeam != null && playerTeam != newTeam && newTeamData != null && newTeamData.hasCore()) {
                             lastTeams.put(playerUUID, player.team());
                             player.team(Team.derelict);
-                            playersReturn.add(playerUUID);
                             welcome(player);
                         } else if (!teamHasCore) {
                             assignFallbackTeamIfNoCore(player);
@@ -818,47 +738,64 @@ Click "Confirm" to start.
         });
     }
 
-    private static final int menuId = Menus.registerMenu((player, choice) -> {
-        if (choice == 1) {
-            Team newTeam = playerTeams.get(player.uuid());
-            if (newTeam != null) player.team(newTeam);
-            lastTeams.remove(player.uuid());
-            playersReturn.remove(player.uuid());
-            playerTeams.remove(player.uuid());
-        } else if (choice == 0) {
-            if (!playersReturn.contains(player.uuid())) return;
-            playersReturn.remove(player.uuid());
-            playerTeams.remove(player.uuid());
-
-            Team lastTeam = lastTeams.remove(player.uuid());
-            boolean validLastTeam = lastTeam != null &&
-                    Vars.state.teams.get(lastTeam) != null &&
-                    Vars.state.teams.get(lastTeam).hasCore();
-
-            if (validLastTeam) {
-                player.team(lastTeam);
-            } else {
-                assignFallbackTeamIfNoCore(player);
-            }
-        }
-    });
 
     @Override
     public void registerClientCommands(CommandHandler handler) {
 
         handler.removeCommand("a");
-        handler.<Player>register("help", "[page]", (args, player) -> {
-            StringBuilder helpMessage = new StringBuilder("Available Commands:\n");
-
-            for (String command : commands) {
-                helpMessage.append("[#D1DBF2FF]").append(command).append("\n");
+        handler.removeCommand("t");
+        handler.removeCommand("vote");
+        handler.removeCommand("votekick");
+        handler.<Player>register("t", "<message...>", "Send a message only to your teammates.", (args, player) -> {
+            if (args.length == 0) {
+                player.sendMessage("[#D1DBF2FF]You must enter a message to send to your teammates.");
+                return;
             }
-            player.sendMessage(helpMessage.append("[]").toString());
+            String message = args[0];
+            String formatted = "<Team> " + player.name + ": " + message;
+            Groups.player.each(p -> p.team() == player.team(), teammate -> teammate.sendMessage(formatted));
+        });
+        handler.<Player>register("help", "[page]", "List all available commands.", (args, player) -> {
+            int page = 1;
+            if (args.length > 0) {
+                try {
+                    page = Integer.parseInt(args[0]);
+                } catch (NumberFormatException e) {
+                    player.sendMessage("[#D1DBF2FF]Invalid page number.[]");
+                    return;
+                }
+            }
+
+            Seq<CommandHandler.Command> commandList = handler.getCommandList();
+            int commandsPerPage = 15;
+            int totalCommands = commandList.size;
+            int totalPages = (int) Math.ceil((double) totalCommands / commandsPerPage);
+
+            if (page < 1 || page > totalPages) {
+                player.sendMessage("[#D1DBF2FF]Invalid page number. Please enter a valid page number between 1 and " + totalPages + ".[]");
+                return;
+            }
+
+            int startIndex = (page - 1) * commandsPerPage;
+            int endIndex = Math.min(page * commandsPerPage, totalCommands);
+
+            StringBuilder result = new StringBuilder("[#FFFFFFFF]Available Commands (Page " + page + "/" + totalPages + "):[]\n");
+
+            for (int i = startIndex; i < endIndex; i++) {
+                CommandHandler.Command cmd = commandList.get(i);
+                result.append("[#D1DBF2FF]/").append(cmd.text);
+                if (!cmd.paramText.isEmpty()) result.append(" ").append(cmd.paramText);
+                result.append("[] - ").append(cmd.description).append("\n");
+            }
+
+            player.sendMessage(result.toString());
         });
 
-        handler.<Player>register("snow", "snow", (args, player) -> {
+        handler.<Player>register("snow", "Summon Snow.", (args, player) -> {
             if (snowCommandUsed) {
-                player.sendMessage("[#D1DBF2FF]The snow effect has already been applied in this game.");
+                player.sendMessage("[#D1DBF2FF]The snow magic has already been cast in this game.");
+                Call.effect(Fx.breakProp, player.x, player.y, 0, Color.white);
+                Call.effect(Fx.lightning, player.x, player.y, 0, Color.white);
                 return;
             }
             String playerUUID = player.uuid();
@@ -877,12 +814,22 @@ Click "Confirm" to start.
                     netServer.sendWorldData(p);
                 }
                 snowCommandUsed = true;
+                Call.sendMessage("[#FFFFFFFF]" + player.name + "[][#D1DBF2FF] has summoned gentle snow upon the land.[]");
+                Call.effect(Fx.healWave, player.x, player.y, 0, Color.white);
+                Call.effect(Fx.lightning, player.x, player.y, 0, Color.white);
             } else {
+                for (int i = 0; i < 3; i++) {
+                    float angle = i * 120f;
+                    float radius = 20f;
+                    float fx = player.x + Mathf.cosDeg(angle) * radius;
+                    float fy = player.y + Mathf.sinDeg(angle) * radius;
+                    Call.effect(Fx.smeltsmoke, fx, fy, 0, Color.white);
+                }
                 player.sendMessage("[#D1DBF2FF]You must be an admin or has 50+ points.");
             }
         });
 
-        handler.<Player>register("time", "show time", (args, player) -> {
+        handler.<Player>register("time", "Show time.", (args, player) -> {
             long duration = Time.timeSinceMillis(gameStartTime); // 毫秒
             int minutes = (int) (duration / 1000 / 60);
             float totalMinutes = playtimeData.get(player.uuid(), 0f);
@@ -971,32 +918,32 @@ Click "Confirm" to start.
             }
         });
 
-        handler.<Player>register("upload", "", (args, player) -> {
+        handler.<Player>register("upload", "Upload maps.", (args, player) -> {
             String playerUUID = player.uuid();
             int current = rankData.containsKey(playerUUID) ? rankData.get(playerUUID) : 0;
-            if (current > 300 || player.admin) {
+            if (current > 50 || player.admin) {
                 String token = TokenManager.generateToken();
                 int port = config.port;
                 String url = "http://" + globalUrl + ":" + port + "/?token=" + token;
                 player.sendMessage("[#FFFFFFFF]Upload link (valid 5 min): [][#D1DBF2FF]" + url + "[]");
                 Call.openURI(player.con, url);
             } else {
-                player.sendMessage("[#D1DBF2FF]You need 300+ points or admin to upload maps. Max size: 200×200. Must fit current mode.");
+                player.sendMessage("[#D1DBF2FF]You need 50+ points or admin to upload maps. Max size: 200×200. Must fit current mode.");
             }
         });
 
-        handler.<Player>register("discord", "", (args, player) -> {
+        handler.<Player>register("discord", "Discord link.", (args, player) -> {
             String url ="https://discord.gg/ajvwQMx8";
             player.sendMessage("[#FFFFFFFF]Invite link: [][#D1DBF2FF]" + url + "[]");
             Call.openURI(player.con, url);
         });
 
-        handler.<Player>register("toggle", "Admin status toggle", (args, player) -> {
+        handler.<Player>register("toggle", "Toggle admin status.", (args, player) -> {
             String playerUUID = player.uuid();
             int current = rankData.containsKey(playerUUID) ? rankData.get(playerUUID) : 0;
             boolean isApproved = approvedAdmins.getOrDefault(player.uuid(), false);
 
-            if (current > 5000 || isApproved || player.admin) {
+            if (current > 1000 || isApproved || player.admin) {
 
                 if (!player.admin) {
                     player.admin = true;
@@ -1009,13 +956,13 @@ Click "Confirm" to start.
                 }
 
             } else {
-                player.sendMessage("[#D1DBF2FF]You need at least 5000 points to become admin. Current: "
+                player.sendMessage("[#D1DBF2FF]You need at least 1000 points to become admin. Current: "
                         + String.format("%d", current) + "[]");
             }
         });
 
 
-        handler.<Player>register("tr", "[language]", "Set your language for automatic translation", (args, player) -> {
+        handler.<Player>register("tr", "[language]", "Set your language for automatic translation.", (args, player) -> {
             if (args.length != 1) {
                 player.sendMessage("[#D1DBF2FF]Usage: /tr [auto/off/zh/en/es/fr/de/ja/ko/ru/tr][]");
                 return;
@@ -1043,7 +990,7 @@ Click "Confirm" to start.
             player.sendMessage("[#D1DBF2FF]Language set to " + targetLanguage + " for translations.[]");
         });
 
-        handler.<Player>register("maps", "[page]", "List all available maps with pagination", (args, player) -> {
+        handler.<Player>register("maps", "[page]", "List all available maps.", (args, player) -> {
             int page = 1;
             if (args.length > 0) {
                 try {
@@ -1088,7 +1035,7 @@ Click "Confirm" to start.
             }
         });
 
-        handler.<Player>register("rank", "[page]", "rankings", (args, player) -> {
+        handler.<Player>register("rank", "[page]", "Rankings.", (args, player) -> {
             int page = 1;
             if (args.length > 0) {
                 try {
@@ -1142,42 +1089,76 @@ Click "Confirm" to start.
             player.sendMessage(message.toString());
         });
 
-        handler.<Player>register("rtv", "[mapId/partialName]", "Vote to change map", (args, player) -> {
-            if (currentVote) {
-                player.sendMessage("[#D1DBF2DD]There is already a voting process.[]");
+
+        handler.<Player>register("rtv", "[mapId/name]","Vote to change map.", (args, player) -> {
+            if (voteInProgress) {
+                player.sendMessage("[#D1DBF2FF]A vote is already in progress.[]");
                 return;
             }
-            if (args.length == 0) {
-                Seq<Map> availableMaps = Vars.maps.customMaps().isEmpty() ? Vars.maps.defaultMaps() : Vars.maps.customMaps();
-                Map randomMap = availableMaps.get(new Random().nextInt(availableMaps.size));
-                startVote(player, randomMap);
-            } else {
-                String input = args[0];
-                Seq<Map> availableMaps = Vars.maps.customMaps().isEmpty() ? Vars.maps.defaultMaps() : Vars.maps.customMaps();
 
+            Seq<Map> maps = Vars.maps.customMaps().isEmpty() ? Vars.maps.defaultMaps() : Vars.maps.customMaps();
+            Map selected = null;
+
+            if (args.length > 0) {
+                String input = args[0];
                 if (input.matches("\\d+")) {
-                    int mapIndex = Integer.parseInt(input) - 1;
-                    if (mapIndex >= 0 && mapIndex < availableMaps.size) {
-                        startVote(player, availableMaps.get(mapIndex));
-                    } else {
-                        player.sendMessage("[#D1DBF2DD]Invalid map number.[]");
-                    }
+                    int index = Integer.parseInt(input) - 1;
+                    if (index >= 0 && index < maps.size) selected = maps.get(index);
                 } else {
-                    Map matchedMap = null;
-                    for (Map map : availableMaps) {
+                    for (Map map : maps) {
                         if (map.name().toLowerCase().contains(input.toLowerCase())) {
-                            matchedMap = map;
+                            selected = map;
                             break;
                         }
                     }
-
-                    if (matchedMap == null) {
-                        player.sendMessage("[#D1DBF2DD]No map found.[]");
-                        return;
-                    }
-                    startVote(player, matchedMap);
                 }
+            } else {
+                selected = maps.random();
             }
+
+            if (selected == null) {
+                player.sendMessage("[#D1DBF2FF]Map not found.[]");
+                return;
+            }
+
+            if (Groups.player.size() <= 1 || player.admin) {
+                Call.sendMessage("[#D1DBF2FF]" + player.name + " changed the map to " + selected.name() + ".[]");
+                loadMap(selected);
+                resetGameState();
+                return;
+            }
+
+            beginVote(player, false, selected, null);
+        });
+
+        handler.<Player>register("votekick", "<player>", "Start a vote to kick a player", (args, player) -> {
+            if (voteInProgress) {
+                player.sendMessage("[#D1DBF2FF]A vote is already in progress.[]");
+                return;
+            }
+            if (args.length == 0) {
+                player.sendMessage("[#D1DBF2FF]You must specify a player to kick.[]");
+                return;
+            }
+
+            Player target = Groups.player.find(p -> p.name().toLowerCase().contains(args[0].toLowerCase()));
+
+            if (target == null) {
+                player.sendMessage("[#D1DBF2FF]Player not found.[]");
+                return;
+            }
+            if (target == player) {
+                player.sendMessage("[#D1DBF2FF]You cannot kick yourself.[]");
+                return;
+            }
+
+            if (player.admin) {
+                Call.sendMessage("[#D1DBF2FF]" + player.name + " kicked " + target.name + " directly.[]");
+                target.kick("[#D1DBF2FF]You were kicked by an admin.[]");
+                return;
+            }
+            
+            beginVote(player, true, null, target);
         });
     }
 }
