@@ -1,5 +1,6 @@
 package plugin;
 
+import arc.files.Fi;
 import fi.iki.elonen.NanoHTTPD;
 
 import java.io.*;
@@ -34,7 +35,25 @@ public class MapUploadServer extends NanoHTTPD {
         if (!TokenManager.isValid(token)) {
             return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "Forbidden or expired token.");
         }
+        String uri = session.getUri();
+        if (Method.GET.equals(session.getMethod()) && uri.equals("/download")) {
+            String fileName = params.getOrDefault("file", List.of("")).get(0);
+            if (!fileName.endsWith(".msav")) {
+                return newFixedLengthResponse(Response.Status.BAD_REQUEST, MIME_PLAINTEXT, "Invalid file.");
+            }
 
+            File file = new File(mapDir, fileName);
+            if (!file.exists()) {
+                return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "File not found.");
+            }
+
+            try {
+                FileInputStream fis = new FileInputStream(file);
+                return newChunkedResponse(Response.Status.OK, "application/octet-stream", fis);
+            } catch (IOException e) {
+                return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Download error.");
+            }
+        }
         if (Method.GET.equals(session.getMethod())) {
             StringBuilder html = new StringBuilder("<html><body>");
             html.append("<h2>").append(title).append("</h2>")
@@ -45,10 +64,18 @@ public class MapUploadServer extends NanoHTTPD {
                     .append("<input type='submit' value='Upload' /></form>");
 
             html.append("<h3>Uploaded Maps:</h3><ul>");
-            for (File file : Objects.requireNonNull(mapDir.listFiles((dir, name) -> name.endsWith(".msav")))) {
-                html.append("<li>").append(file.getName()).append("</li>");
+            for (mindustry.maps.Map map : Vars.maps.customMaps()) {
+                Fi file = map.file;
+                String fileName = file.name();
+                String mapName = map.name();
+
+                html.append("<li>")
+                        .append("<a href='/download?file=").append(fileName).append("&token=").append(token).append("'>")
+                        .append(fileName).append("</a>")
+                        .append(" - ").append(mapName)
+                        .append("</li>");
             }
-            html.append("</ul></body></html>");
+
             return newFixedLengthResponse(html.toString());
         }
 
@@ -101,5 +128,6 @@ public class MapUploadServer extends NanoHTTPD {
 
         return newFixedLengthResponse("Unsupported request.");
     }
+
 
 }
