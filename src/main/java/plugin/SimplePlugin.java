@@ -2,12 +2,14 @@ package plugin;
 
 import arc.Events;
 import arc.graphics.Color;
+import arc.math.Mathf;
 import arc.net.Server;
 import arc.util.*;
 import arc.util.Timer;
 import mindustry.Vars;
 import mindustry.content.UnitTypes;
 import mindustry.core.GameState;
+import mindustry.core.NetServer;
 import mindustry.core.Version;
 import mindustry.game.EventType;
 import mindustry.game.EventType.*;
@@ -249,38 +251,6 @@ public class SimplePlugin extends Plugin {
             save();
         }
     }
-    public static void assignFallbackTeamIfNoCore(Player player) {
-        if (player == null || player.team() == null) {
-            Log.warn("Cannot assign fallback team: player or player team is null.");
-            return;
-        }
-
-        boolean teamHasCore = state.teams.get(player.team()) != null &&
-                state.teams.get(player.team()).hasCore();
-
-        if (!teamHasCore) {
-            Team fallbackTeam = null;
-            int minPlayers = Integer.MAX_VALUE;
-
-            for (Team team : Team.all) {
-                if (team == Team.derelict) continue;
-                var teamData = state.teams.get(team);
-                if (teamData == null || !teamData.hasCore()) continue;
-
-                int playerCount = Groups.player.count(p -> p.team() == team);
-                if (playerCount < minPlayers) {
-                    fallbackTeam = team;
-                    minPlayers = playerCount;
-                }
-            }
-
-            if (fallbackTeam != null && fallbackTeam != player.team()) {
-                player.team(fallbackTeam);
-                Log.info("Assigned fallback team " + fallbackTeam.name + " to player " + player.name);
-            }
-        }
-    }
-
     public void collectLeaderboardData() {
         Seq<Player> onlineWithScore = Groups.player.copy().select(p -> rankData.get(p.uuid(), 0) > 0);
         updatedBuilder.setLength(0);
@@ -291,7 +261,7 @@ public class SimplePlugin extends Plugin {
             for (int i = 0; i < onlineWithScore.size; i++) {
                 Player p = onlineWithScore.get(i);
                 int score = rankData.get(p.uuid(), 0);
-                updatedBuilder.append("[]").append(i + 1).append(". ")
+                updatedBuilder.append("[#DEE5F5FF]").append(i + 1).append(". ")
                         .append(p.name).append(": [#DEE5F5FF]")
                         .append(score).append("[]\n");
             }
@@ -316,18 +286,6 @@ public class SimplePlugin extends Plugin {
                 .submit(response -> result.get(reader.parse(response.getResultAsString()).get(0).get(0).asString()));
     }
 
-    public static void localeAsync(String message, Player player, Cons<String> onResult, Runnable onError) {
-        String playerLocale = player.locale != null ? player.locale : "en";
-        translate(message, "auto", playerLocale, onResult, onError);
-    }
-
-    public static void localeAsyncOne(String message, Player player) {
-        localeAsync(message, player,
-                translated -> player.sendMessage("[#DEE5F5FF]" + translated + "[]"),
-                () -> player.sendMessage("[#DEE5F5FF]" + message + "[]")
-        );
-    }
-
     public static void reloadWorld(Runnable runnable) {
         try {
             WorldReloader reloader = new WorldReloader();
@@ -339,42 +297,19 @@ public class SimplePlugin extends Plugin {
         }
     }
 
-    private static final int menuId = Menus.registerMenu((player, choice) -> {
-        if (choice == 1) {
-            Team newTeam = playerTeams.get(player.uuid());
-            if (newTeam != null) player.team(newTeam);
-            playerTeams.remove(player.uuid());
-        } else if (choice == 0) {
-            playerTeams.remove(player.uuid());
-            Team lastTeam = player.team();
-            boolean validLastTeam = lastTeam != null &&
-                    state.teams.get(lastTeam) != null &&
-                    state.teams.get(lastTeam).hasCore();
-            if (validLastTeam) {
-                player.team(lastTeam);
-            } else {
-                assignFallbackTeamIfNoCore(player);
-            }
-        }
-    });
 
     private static final int playerMenuId = Menus.registerMenu((player, choice) -> {
         if (choice == 1) {
             String playerUUID = player.uuid();
-            Team playerTeam = player.team();
-            boolean validLastTeam = playerTeam != null &&
-                    state.teams.get(playerTeam) != null &&
-                    state.teams.get(playerTeam).hasCore();
-            if (validLastTeam) {
-                player.team(playerTeam);
-            } else {
-                assignFallbackTeamIfNoCore(player);
-            }
             Timer.Task task = confirmTasks.remove(playerUUID);
             if (task != null) {
                 task.cancel();
             }
             addIP(player.con.address);
+            String raw = "Welcome to snow!";
+            String lang = player.locale();
+            translate(raw, "auto", lang, translated -> Call.announce(player.con, translated), () -> Call.announce(player.con, raw));
+            Timer.schedule(() -> showMapLabel(player), 3f);
         } else if (choice == 0) {
             String playerUUID = player.uuid();
             Timer.Task task = confirmTasks.remove(playerUUID);
@@ -384,18 +319,59 @@ public class SimplePlugin extends Plugin {
             player.con.kick();
         }
     });
-    private static void showMenu(NetConnection con, int menuId, String title, String content, String[] options) {
+
+    private static void showMenu(NetConnection con, String[] options) {
         String[][] opts = {{options[0], options[1]}};
-        Call.menu(con, menuId, title, content, opts);
+        Call.menu(con, SimplePlugin.playerMenuId, "Welcome to snow", "Click \"Confirm\" to start.", opts);
     }
 
-    public static void welcome(NetConnection con) {
-        showMenu(con, menuId, "Welcome back", "Return to your previous game team?", new String[]{"Cancel", "Confirm"});
-    }
+    public NetServer.TeamAssigner assign = (player, players) -> {
+        if(state.rules.pvp){
+            boolean hasLost = Boolean.TRUE.equals(lostTeam.get(player.uuid()));
+            Team previousTeam = playerTeams.get(player.uuid());
+            if (hasLost) {
+                Call.announce(player.con, "Your team has lost. Please wait for the next round.");
+                return Team.derelict;
+            } else if(previousTeam != null){
+                Teams.TeamData prevData = state.teams.get(previousTeam);
+                if(prevData != null && previousTeam != Team.derelict && prevData.hasCore()){
+                    int activeTeamCount = state.teams.getActive().count(data ->
+                            data.team != Team.derelict && data.hasCore());
+                    int totalPlayers = 0;
+                    int teamCount = 0;
+                    for(Player p : players){
+                        if(p != player){
+                            totalPlayers++;
+                            if(p.team() == previousTeam){
+                                teamCount++;
+                            }
+                        }
+                    }
+                    int average = (int)Math.ceil((double)totalPlayers / Math.max(activeTeamCount, 1));
+                    if(teamCount <= average){
+                        return previousTeam;
+                    }
+                }
+            } else  {
+                Teams.TeamData re = state.teams.getActive().min(data -> {
+                    if ((state.rules.waveTeam == data.team && state.rules.waves) || !data.hasCore() || data.team == Team.derelict)
+                        return Integer.MAX_VALUE;
 
-    public static void confirm(NetConnection con) {
-        showMenu(con, playerMenuId, "Welcome to snow", "Click \"Confirm\" to start.", new String[]{"Cancel", "Confirm"});
-    }
+                    int count = 0;
+                    for (Player other : players) {
+                        if (other.team() == data.team && other != player) {
+                            count++;
+                        }
+                    }
+                    return (float) count + Mathf.random(-0.1f, 0.1f);
+                });
+                return re == null ? null : re.team;
+            }
+        }
+        return state.rules.defaultTeam;
+    };
+
+
 
     private static void beginVote(Player initiator, boolean isKick, Map map, Player target, String reason) {
         voteInProgress = true;
@@ -483,7 +459,7 @@ public class SimplePlugin extends Plugin {
         return "y".equals(message) || "yes".equals(message);
     }
 
-    String wrapText(String text) {
+    static String wrapText(String text) {
         StringBuilder wrappedText = new StringBuilder();
         int start = 0;
 
@@ -496,7 +472,7 @@ public class SimplePlugin extends Plugin {
         return wrappedText.toString();
     }
 
-    void showMapLabel(Player player) {
+    static void showMapLabel(Player player) {
         Building build = Groups.build.find(b -> b instanceof CoreBlock.CoreBuild && b.team == player.team());
         CoreBlock.CoreBuild core = build instanceof CoreBlock.CoreBuild ? (CoreBlock.CoreBuild) build : null;
 
@@ -515,7 +491,7 @@ public class SimplePlugin extends Plugin {
         float x = core != null ? core.x : Vars.world.unitWidth() / 2f;
         float y = core != null ? core.y : Vars.world.unitHeight() / 2f;
 
-        Call.labelReliable(player.con, text, 12f, x, y);
+        Call.labelReliable(player.con, text, 10f, x, y);
     }
 
     public static void writeString(ByteBuffer buffer, String string, int maxlen) {
@@ -591,9 +567,6 @@ public class SimplePlugin extends Plugin {
             buffer.position(0);
             handler.respond(buffer);
         });
-
-
-
 
         Vars.net.handleServer(Packets.ConnectPacket.class, (con, packet) -> {
             if (con.kicked) return;
@@ -706,13 +679,12 @@ public class SimplePlugin extends Plugin {
             if (!player.admin && !info.admin) {
                 info.adminUsid = packet.usid;
             }
-
             con.player = player;
-            player.team(Vars.netServer.assignTeam(player));
+            player.team(assign.assign(player, Groups.player));
             Vars.netServer.sendWorldData(player);
             Events.fire(new EventType.PlayerConnect(player));
         });
-        
+
         Vars.netServer.admins.addActionFilter(action -> {
             if (action.type == Administration.ActionType.depositItem && action.player != null) {
                 String uuid = action.player.uuid();
@@ -763,7 +735,7 @@ public class SimplePlugin extends Plugin {
                 }
             } else {
                 String name = player.name;
-                player.sendMessage(name + ": " + message);
+                player.sendMessage("[#DEE5F5FF]" + name + "[]: [#EDF4FCCC]" + message + "[]");
                 Groups.player.each(receiver -> {
                     if (receiver == player) return;
                     String lang = playerLang.get(receiver.uuid());
@@ -771,13 +743,13 @@ public class SimplePlugin extends Plugin {
                     if (needTranslate) {
                         translate(message, "auto", lang, translated -> {
                             if (!translated.equals(message)) {
-                                receiver.sendMessage( name + "[]: [#EDF4FCCC]" + message + " [gray](" + translated + ")[]");
+                                receiver.sendMessage( "[#DEE5F5FF]" + name + "[]: [#EDF4FCCC]" + message + " [gray](" + translated + ")[]");
                             } else {
-                                receiver.sendMessage(name + "[]: [#EDF4FCCC]" + message + "[]");
+                                receiver.sendMessage("[#DEE5F5FF]" + name + "[]: [#EDF4FCCC]" + message + "[]");
                             }
-                        }, () -> receiver.sendMessage(name + "[]: [#EDF4FCCC]" + message + "[]"));
+                        }, () -> receiver.sendMessage("[#DEE5F5FF]" + name + "[]: [#EDF4FCCC]" + message + "[]"));
                     } else {
-                        receiver.sendMessage(name + "[]: [#EDF4FCCC]" + message + "[]");
+                        receiver.sendMessage("[#DEE5F5FF]" + name + "[]: [#EDF4FCCC]" + message + "[]");
                     }
                 });
 
@@ -823,16 +795,20 @@ public class SimplePlugin extends Plugin {
             }
         });
 
-        Events.on(WorldLoadEvent.class, e -> Timer.schedule(() -> Groups.player.each(this::showMapLabel), 2f));
+        Events.on(WorldLoadEvent.class, e -> Timer.schedule(() -> Groups.player.each(SimplePlugin::showMapLabel), 2f));
+
         Events.on(EventType.PlayEvent.class, event -> {
             String mapDescription = Vars.state.map.description();
             state.rules.ambientLight.set(new Color(0.1f, 0.1f, 0.2f, 0.3f));
             state.rules.lighting = true;
             Weather.WeatherEntry entry = new Weather.WeatherEntry();
             entry.weather = Weathers.snow;
-            entry.intensity = 1f;
+            entry.intensity = 0.3f;
             entry.always = true;
             state.rules.weather.add(entry);
+            if (mapDescription.contains("[@fly]")) {
+                applyfly();
+            }
             if (mapDescription.contains("[@fly]")) {
                 applyfly();
             }
@@ -866,14 +842,17 @@ public class SimplePlugin extends Plugin {
                     e.winner != Team.derelict &&
                     state.teams.get(e.winner).hasCore() &&
                     Groups.player.count(p -> p.team() == e.winner) > 0) {
-
                 Seq<Player> winners = Groups.player.copy().select(p -> p.team() == e.winner);
-                Call.sendMessage("[#D1DBF2DD]Game over! [#" + e.winner.color.toString() + "]" + e.winner.name + "[] team wins!");
                 int total = winners.size;
                 int score = Math.max(25, 40 - total * 4);
-                for (Player p : winners) {
-                    addRank(p.uuid(), score);
-                    p.sendMessage("[#D1DBF2DD]You got " + score + " points![]");
+
+                for (Player p : Groups.player) {
+                    if (p.team() == e.winner) {
+                        addRank(p.uuid(), score);
+                        Call.announce(p.con, "Victory! You got [#D1DBF2DD]" + score + "[] points.");
+                    } else {
+                        Call.announce(p.con, "Game Over. Team " + e.winner.name + " wins.");
+                    }
                 }
             }
             java.io.File folder = new java.io.File("config/snapshots");
@@ -894,7 +873,7 @@ public class SimplePlugin extends Plugin {
                 updatePlaytime(playerUUID, 0f);
             }
             if (isNewIP(ip)) {
-                confirm(player.con);
+                showMenu(player.con, new String[]{"Cancel", "Confirm"});
                 Timer.Task task = Timer.schedule(() -> {
                     Player p = Groups.player.find(pl -> pl.uuid().equals(playerUUID));
                     if (p == null || p.con == null) return;
@@ -905,68 +884,34 @@ public class SimplePlugin extends Plugin {
                 }, 10f);
                 confirmTasks.put(playerUUID, task);
             } else {
-                String motdRaw = "Welcome to Snow!";
-                localeAsync(motdRaw, player, player::sendMessage, () -> player.sendMessage(motdRaw));
-                Team newTeam = playerTeams.get(playerUUID);
-                boolean isPVP = state.rules != null && state.rules.mode() == Gamemode.pvp;
-                Team playerTeam = player.team();
-                Teams.TeamData teamData = (state != null && state.teams != null) ? state.teams.get(playerTeam) : null;
-                Teams.TeamData newTeamData = (newTeam != null && state != null && state.teams != null) ? state.teams.get(newTeam) : null;
-                boolean teamHasCore = teamData != null && teamData.hasCore();
-                boolean hasLost = Boolean.TRUE.equals(lostTeam.get(playerUUID)); // null 或 false 均视为未败队
-                if (isPVP) {
-                    if (hasLost) {
-                        localeAsyncOne("Your team has lost. Please wait for the next round.", player);
-                        player.team(Team.derelict);
-                    } else {
-                        if (newTeam != null && playerTeam != newTeam && newTeamData != null && newTeamData.hasCore()) {
-                            welcome(player.con);
-                        } else if (!teamHasCore) {
-                            assignFallbackTeamIfNoCore(player);
-                        }
-                    }
-                }
+                Timer.schedule(() -> showMapLabel(player), 1f);
             }
-
-            showMapLabel(player);
             if (!playerLang.containsKey(playerUUID)) {
                 String lang = player.locale;
                 String detectedLang = (lang == null || lang.isEmpty()) ? "en" : lang;
                 playerLang.put(playerUUID, detectedLang);
             }
-
             lbEnabled.add(player.uuid());
         });
 
         Events.on(BlockDestroyEvent.class, event -> {
             var team = event.tile.team();
-
             if (event.tile.block() instanceof CoreBlock) {
-                Groups.player.each(p -> {
-                    if (!p.team().active()) return;
-                    float cx = p.unit() != null ? p.unit().x : p.x;
-                    float cy = p.unit() != null ? p.unit().y : p.y;
-                    if (p.team() == team) {
-                        Call.labelReliable(p.con, "Your core has been destroyed", 3f, cx, cy);
-                    }
-                });
-
                 if (team != Team.derelict && team.cores().size <= 1) {
                     team.data().players.each(p -> {
                         if (state.rules.mode() == Gamemode.pvp) {
-                            localeAsyncOne("Your team has lost. Please wait for the next round.", p);
                             int size = Math.max(1, team.data().players.size);
                             int penalty = Math.max(20, 50 - size * 3);
                             Integer oldValue = rankData.get(p.uuid());
                             int old = oldValue != null ? oldValue : 0;
                             int updated = Math.max(0, old - penalty);
                             updateRank(p.uuid(), updated);
-                            p.sendMessage("[#DEE5F5FF]You lost " + penalty + " points[]!");
                             lostTeam.put(p.uuid(), true);
-                            p.team(Team.derelict);
-                            p.clearUnit();
+                            String message = "Your team has lost. You lost [#D1DBF2DD]" + penalty + " []points.";
+                            Call.announce(p.con, message);
                         } else {
-                            localeAsyncOne("You lost this game.", p);
+                            String message = "You has lost.";
+                            Call.announce(p.con, message);
                         }
                     });
                 }
@@ -1129,6 +1074,7 @@ public class SimplePlugin extends Plugin {
                     state.set(GameState.State.playing);
                     netServer.openServer();
                     resetGameState();
+                    lostTeam.clear();
                 });
 
                 String displayName = finalTargetFile.getName().replace("autosave-", "").replace(".msav", "");
