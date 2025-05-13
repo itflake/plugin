@@ -2,11 +2,14 @@ package plugin;
 
 import arc.Events;
 import arc.graphics.Color;
-import arc.math.Mathf;
-import arc.util.CommandHandler;
+import arc.net.Server;
+import arc.util.*;
+import arc.util.Timer;
 import mindustry.Vars;
-import mindustry.content.Fx;
+import mindustry.content.UnitTypes;
 import mindustry.core.GameState;
+import mindustry.core.Version;
+import mindustry.game.EventType;
 import mindustry.game.EventType.*;
 import mindustry.game.Gamemode;
 import mindustry.game.Team;
@@ -15,21 +18,18 @@ import mindustry.gen.*;
 import mindustry.io.SaveIO;
 import mindustry.mod.*;
 import mindustry.maps.Map;
-import arc.util.Strings;
 import arc.func.Cons;
 import arc.util.serialization.JsonReader;
-import arc.util.Timer;
-import arc.util.Log;
-import arc.util.Http;
-import mindustry.net.Packets;
-import mindustry.net.WorldReloader;
+import mindustry.net.*;
 import mindustry.net.Administration.Config;
 import arc.struct.Seq;
-import arc.util.Time;
 import mindustry.type.Weather;
 import mindustry.ui.Menus;
 import mindustry.world.blocks.storage.CoreBlock;
 import mindustry.content.Weathers;
+
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.*;
 import java.util.Arrays;
@@ -37,7 +37,8 @@ import arc.files.Fi;
 import arc.util.serialization.Json;
 import arc.struct.*;
 import arc.Core;
-import static mindustry.Vars.netServer;
+
+import static mindustry.Vars.*;
 import static plugin.TokenManager.cleanUpExpiredTokens;
 
 public class SimplePlugin extends Plugin {
@@ -68,7 +69,6 @@ public class SimplePlugin extends Plugin {
     private static final double ratio = 0.6;
     private static final ObjectMap<String, Timer.Task> confirmTasks = new ObjectMap<>();
     private long gameStartTime = Time.millis();
-    private static boolean snowCommandUsed = false;
     private static final Set<String> knownIPs = new HashSet<>();
     private static final Fi ipFile = Vars.saveDirectory.child("ip-list.json");
     private static final Json json = new Json();
@@ -76,7 +76,7 @@ public class SimplePlugin extends Plugin {
     private static final Fi playtimeFile = Vars.saveDirectory.child("playtime.json");
     private static final ObjectMap<String, Float> playtimeData = new ObjectMap<>();
     private static final ObjectMap<String, Integer> rankData = new ObjectMap<>();
-    private static final HashMap<String, Team> lastTeams = new HashMap<>();
+    private final ObjectMap<String, Long> lastUnloadMap = new ObjectMap<>();
     private static final HashMap<String, Team> playerTeams = new HashMap<>();
     private final HashMap<String, String> playerLang = new HashMap<>();
     private final HashMap<String, Boolean> approvedAdmins = new HashMap<>();
@@ -93,9 +93,7 @@ public class SimplePlugin extends Plugin {
         put("tr", "Türkçe");
     }};
     public void resetGameState() {
-        snowCommandUsed = false;
         votes.clear();
-        lastTeams.clear();
         playerTeams.clear();
         lostTeam.clear();
         voteInProgress = false;
@@ -173,10 +171,10 @@ public class SimplePlugin extends Plugin {
 
     public static void addRank(String playerUUID, int rate) {
         int current = rankData.containsKey(playerUUID) ? rankData.get(playerUUID) : 0;
-        updateRankTime(playerUUID, current + rate);
+        updateRank(playerUUID, current + rate);
     }
 
-    public static void updateRankTime(String playerUUID, int rate) {
+    public static void updateRank(String playerUUID, int rate) {
         rankData.put(playerUUID, rate);
         saveRank();
     }
@@ -257,8 +255,8 @@ public class SimplePlugin extends Plugin {
             return;
         }
 
-        boolean teamHasCore = Vars.state.teams.get(player.team()) != null &&
-                Vars.state.teams.get(player.team()).hasCore();
+        boolean teamHasCore = state.teams.get(player.team()) != null &&
+                state.teams.get(player.team()).hasCore();
 
         if (!teamHasCore) {
             Team fallbackTeam = null;
@@ -266,7 +264,7 @@ public class SimplePlugin extends Plugin {
 
             for (Team team : Team.all) {
                 if (team == Team.derelict) continue;
-                var teamData = Vars.state.teams.get(team);
+                var teamData = state.teams.get(team);
                 if (teamData == null || !teamData.hasCore()) continue;
 
                 int playerCount = Groups.player.count(p -> p.team() == team);
@@ -293,8 +291,8 @@ public class SimplePlugin extends Plugin {
             for (int i = 0; i < onlineWithScore.size; i++) {
                 Player p = onlineWithScore.get(i);
                 int score = rankData.get(p.uuid(), 0);
-                updatedBuilder.append("[#D1DBF2FF]").append(i + 1).append(". ")
-                        .append(p.name).append(": ")
+                updatedBuilder.append("[]").append(i + 1).append(". ")
+                        .append(p.name).append(": [#DEE5F5FF]")
                         .append(score).append("[]\n");
             }
         }
@@ -325,8 +323,8 @@ public class SimplePlugin extends Plugin {
 
     public static void localeAsyncOne(String message, Player player) {
         localeAsync(message, player,
-                translated -> player.sendMessage("[#D1DBF2FF]" + translated + "[]"),
-                () -> player.sendMessage("[#D1DBF2FF]" + message + "[]")
+                translated -> player.sendMessage("[#DEE5F5FF]" + translated + "[]"),
+                () -> player.sendMessage("[#DEE5F5FF]" + message + "[]")
         );
     }
 
@@ -345,16 +343,13 @@ public class SimplePlugin extends Plugin {
         if (choice == 1) {
             Team newTeam = playerTeams.get(player.uuid());
             if (newTeam != null) player.team(newTeam);
-            lastTeams.remove(player.uuid());
             playerTeams.remove(player.uuid());
         } else if (choice == 0) {
             playerTeams.remove(player.uuid());
-
-            Team lastTeam = lastTeams.remove(player.uuid());
+            Team lastTeam = player.team();
             boolean validLastTeam = lastTeam != null &&
-                    Vars.state.teams.get(lastTeam) != null &&
-                    Vars.state.teams.get(lastTeam).hasCore();
-
+                    state.teams.get(lastTeam) != null &&
+                    state.teams.get(lastTeam).hasCore();
             if (validLastTeam) {
                 player.team(lastTeam);
             } else {
@@ -366,12 +361,12 @@ public class SimplePlugin extends Plugin {
     private static final int playerMenuId = Menus.registerMenu((player, choice) -> {
         if (choice == 1) {
             String playerUUID = player.uuid();
-            Team lastTeam = lastTeams.remove(player.uuid());
-            boolean validLastTeam = lastTeam != null &&
-                    Vars.state.teams.get(lastTeam) != null &&
-                    Vars.state.teams.get(lastTeam).hasCore();
+            Team playerTeam = player.team();
+            boolean validLastTeam = playerTeam != null &&
+                    state.teams.get(playerTeam) != null &&
+                    state.teams.get(playerTeam).hasCore();
             if (validLastTeam) {
-                player.team(lastTeam);
+                player.team(playerTeam);
             } else {
                 assignFallbackTeamIfNoCore(player);
             }
@@ -389,23 +384,20 @@ public class SimplePlugin extends Plugin {
             player.con.kick();
         }
     });
-    private static void showTranslatedMenu(Player player, int menuId, String titleRaw, String contentRaw, String[] options) {
-        translate(titleRaw, "auto", player.locale, title -> translate(contentRaw, "auto", player.locale, content -> translate(options[0], "auto", player.locale, opt0 -> translate(options[1], "auto", player.locale, opt1 -> {
-            String[][] opts = {{opt0, opt1}};
-            Call.menu(player.con, menuId,
-                    title.equals(titleRaw) ? titleRaw : title,
-                    content.equals(contentRaw) ? contentRaw : content,
-                    opts);
-        }, () -> Call.menu(player.con, menuId, titleRaw, contentRaw, new String[][]{{opt0, options[1]}})), () -> Call.menu(player.con, menuId, titleRaw, contentRaw, new String[][]{{options[0], options[1]}})), () -> Call.menu(player.con, menuId, titleRaw, contentRaw, new String[][]{{options[0], options[1]}})), () -> Call.menu(player.con, menuId, titleRaw, contentRaw, new String[][]{{options[0], options[1]}}));
-    }
-    public static void welcome(Player player) {
-        showTranslatedMenu(player, menuId, "Welcome back", "Return to your previous game team?", new String[]{"Cancel", "Confirm"});
-    }
-    public static void confirm(Player player) {
-        showTranslatedMenu(player, playerMenuId, "Welcome to Snow", "Click \"Confirm\" to start.", new String[]{"Cancel", "Confirm"});
+    private static void showMenu(NetConnection con, int menuId, String title, String content, String[] options) {
+        String[][] opts = {{options[0], options[1]}};
+        Call.menu(con, menuId, title, content, opts);
     }
 
-    private static void beginVote(Player initiator, boolean isKick, Map map, Player target) {
+    public static void welcome(NetConnection con) {
+        showMenu(con, menuId, "Welcome back", "Return to your previous game team?", new String[]{"Cancel", "Confirm"});
+    }
+
+    public static void confirm(NetConnection con) {
+        showMenu(con, playerMenuId, "Welcome to snow", "Click \"Confirm\" to start.", new String[]{"Cancel", "Confirm"});
+    }
+
+    private static void beginVote(Player initiator, boolean isKick, Map map, Player target, String reason) {
         voteInProgress = true;
         voteInitiator = initiator;
         kickVote = isKick;
@@ -414,12 +406,34 @@ public class SimplePlugin extends Plugin {
         votes.clear();
         votes.add(initiator.uuid());
         int req = (int)Math.ceil(Groups.player.size() * ratio);
-        String message = isKick
-                ? "[#FFFFFFFF]" + initiator.name + "[][#D1DBF2FF] started a vote to kick [#FFFFFFFF]" + target.name + "[][#D1DBF2FF]. [white](1/" + req + ")[]\nType [#FFFFFFFF]y[] [#D1DBF2FF]to vote.[]"
-                : "[#FFFFFFFF]" + initiator.name + "[][#D1DBF2FF] started a vote to change the map to [#FFFFFFFF]" + map.name() + "[][#D1DBF2FF]. [white](1/" + req + ")[]\nType [#FFFFFFFF]y[] [#D1DBF2FF]to vote.[]";
-        Call.sendMessage(message);
-        voteTimer = Timer.schedule(SimplePlugin::endVote, voteDuration);
+
+        StringBuilder message = new StringBuilder();
+
+        if (isKick) {
+            message.append("[#F1F1F1FF]").append(initiator.name)
+                    .append("[][#DEE5F5FF] started a vote to kick [#F1F1F1FF]")
+                    .append(target.name)
+                    .append("[][#DEE5F5FF]. [white](1/").append(req).append(")[]");
+            if (reason != null && !reason.trim().isEmpty()) {
+                message.append("\n[#DEE5F5FF]Reason: [white]").append(reason.trim());
+            }
+            message.append("\n[#DEE5F5FF]Type [#F1F1F1FF]y[] to vote.[]");
+        } else {
+            message.append("[#F1F1F1FF]").append(initiator.name)
+                    .append("[][#DEE5F5FF] started a vote to change the map to [#F1F1F1FF]")
+                    .append(map.name())
+                    .append("[][#DEE5F5FF]. [white](1/").append(req).append(")[]\n[#DEE5F5FF]Type [#F1F1F1FF]y[] to vote.[]");
+        }
+
+        Call.sendMessage(message.toString());
+        voteTimer = Timer.schedule(() -> {
+            if (votes.size < req) {
+                Call.sendMessage("[#DEE5F5FF]Vote failed.");
+            }
+            endVote();
+        }, voteDuration);
     }
+
 
     private static void endVote() {
         voteInProgress = false;
@@ -435,11 +449,20 @@ public class SimplePlugin extends Plugin {
     }
 
     private static void loadMap(Map map) {
+        if (map == null) return;
+        Gamemode mode = state.rules.mode();
+        java.io.File folder = new java.io.File("config/snapshots");
+        if (folder.exists()) {
+            for (java.io.File file : Objects.requireNonNull(folder.listFiles((dir, name) -> name.startsWith("autosave-")))) {
+                //noinspection ResultOfMethodCallIgnored
+                file.delete();
+            }
+        }
         reloadWorld(() -> {
-            Gamemode mode = Vars.state.rules.mode();
-            Vars.state.map = map;
+            state.map = map;
             Vars.world.loadMap(map);
-            Vars.state.rules = map.applyRules(mode);
+            state.rules = map.applyRules(mode);
+            Log.info("Using gamemode: @", state.rules.mode().name());
             Vars.logic.play();
         });
     }
@@ -456,61 +479,319 @@ public class SimplePlugin extends Plugin {
         return false;
     }
 
-    private boolean isValidName(String name) {
-        if (containsBannedWord(name)) return false;
-        if (name.codePointCount(0, name.length()) > 40) return false;
-
-        for (int i = 0; i < name.length(); ) {
-            int codePoint = name.codePointAt(i);
-            i += Character.charCount(codePoint);
-
-            if (isAllowedUnicode(codePoint)) continue;
-
-            return false;
-        }
-        return true;
-    }
-
-    private boolean isAllowedUnicode(int codePoint) {
-        Character.UnicodeBlock block = Character.UnicodeBlock.of(codePoint);
-        return
-                (codePoint >= 32 && codePoint <= 126) ||
-                        // Chinese
-                        block == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS ||
-                        block == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS_EXTENSION_A ||
-                        block == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS_EXTENSION_B ||
-                        block == Character.UnicodeBlock.CJK_SYMBOLS_AND_PUNCTUATION ||
-                        block == Character.UnicodeBlock.GENERAL_PUNCTUATION ||
-                        block == Character.UnicodeBlock.BASIC_LATIN ||
-                        // Japanese
-                        block == Character.UnicodeBlock.HIRAGANA ||
-                        block == Character.UnicodeBlock.KATAKANA ||
-                        block == Character.UnicodeBlock.KATAKANA_PHONETIC_EXTENSIONS ||
-                        // Korean
-                        block == Character.UnicodeBlock.HANGUL_SYLLABLES ||
-                        block == Character.UnicodeBlock.HANGUL_JAMO ||
-                        block == Character.UnicodeBlock.HANGUL_COMPATIBILITY_JAMO ||
-                        // Russian
-                        block == Character.UnicodeBlock.CYRILLIC ||
-                        block == Character.UnicodeBlock.CYRILLIC_SUPPLEMENTARY ||
-                        block == Character.UnicodeBlock.CYRILLIC_EXTENDED_A ||
-                        block == Character.UnicodeBlock.CYRILLIC_EXTENDED_B;
-    }
-
     private boolean isYes(String message) {
         return "y".equals(message) || "yes".equals(message);
     }
 
+    String wrapText(String text) {
+        StringBuilder wrappedText = new StringBuilder();
+        int start = 0;
+
+        while (start < text.length()) {
+            int end = Math.min(start + 50, text.length());
+            wrappedText.append(text, start, end).append("\n");
+            start = end;
+        }
+
+        return wrappedText.toString();
+    }
+
+    void showMapLabel(Player player) {
+        Building build = Groups.build.find(b -> b instanceof CoreBlock.CoreBuild && b.team == player.team());
+        CoreBlock.CoreBuild core = build instanceof CoreBlock.CoreBuild ? (CoreBlock.CoreBuild) build : null;
+
+        String mapName = state.map.name();
+        String mapAuthor = state.map.author();
+        String mapDesc = state.map.description();
+
+        String text = "[white]" + mapName;
+        if (mapAuthor != null && !mapAuthor.trim().isEmpty()) {
+            text += "\n\n[#DEE5F5FF]" + mapAuthor.trim();
+        }
+        if (mapDesc != null && !mapDesc.trim().isEmpty()) {
+            text += "\n\n[#DEE5F5FF]" + wrapText(mapDesc.trim());
+        }
+
+        float x = core != null ? core.x : Vars.world.unitWidth() / 2f;
+        float y = core != null ? core.y : Vars.world.unitHeight() / 2f;
+
+        Call.labelReliable(player.con, text, 12f, x, y);
+    }
+
+    public static void writeString(ByteBuffer buffer, String string, int maxlen) {
+        if (string == null) {
+            throw new IllegalArgumentException("String cannot be null.");
+        }
+
+        byte[] bytes = string.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length > maxlen) {
+            bytes = Arrays.copyOfRange(bytes, 0, maxlen);
+        }
+
+        buffer.put((byte) bytes.length);
+
+        buffer.put(bytes);
+    }
+
+    public static void applyfly() {
+        UnitTypes.risso.flying = true;
+        UnitTypes.minke.flying = true;
+        UnitTypes.bryde.flying = true;
+        UnitTypes.sei.flying = true;
+        UnitTypes.omura.flying = true;
+        UnitTypes.retusa.flying = true;
+        UnitTypes.oxynoe.flying = true;
+        UnitTypes.cyerce.flying = true;
+        UnitTypes.aegires.flying = true;
+        UnitTypes.navanax.flying = true;
+
+        UnitTypes.crawler.flying = true;
+        UnitTypes.atrax.flying = true;
+        UnitTypes.spiroct.flying = true;
+    }
+
+    @Override
+    public void init() {
+        load();
+        webInit();
+        loadTime();
+        loadRank();
+        showLeaderboard();
+        ArcNetProvider provider = Reflect.get(Vars.net, "provider");
+        Server server = Reflect.get(provider, "server");
+        final String[] footer = {""};
+
+        server.setDiscoveryHandler((address, handler) -> {
+            String rawName = Administration.Config.serverName.string();
+            String rawDesc = Administration.Config.desc.string();
+            String mapName = state.map.name();
+            String modeName = state.rules.modeName;
+
+            int totalPlayers = Core.settings.getInt("totalPlayers", Groups.player.size());
+            int wave = state.wave;
+            int build = Version.build;
+            int limit = Math.max(netServer.admins.getPlayerLimit(), 0);
+
+            String displayDesc = rawDesc.equals("off") ? footer[0] : rawDesc + footer[0];
+            ByteBuffer buffer = ByteBuffer.allocate(500);
+            writeString(buffer, rawName, 100);
+            writeString(buffer, mapName, 64);
+            buffer.putInt(totalPlayers);
+            buffer.putInt(wave);
+            buffer.putInt(build);
+            writeString(buffer, Version.type, 50);
+            buffer.put((byte) state.rules.mode().ordinal());
+            buffer.putInt(limit);
+            writeString(buffer, displayDesc, 200);
+
+            if (modeName != null) {
+                writeString(buffer, "[#DEE5F5FF]" + modeName, 50);
+            }
+
+            buffer.position(0);
+            handler.respond(buffer);
+        });
+
+
+
+
+        Vars.net.handleServer(Packets.ConnectPacket.class, (con, packet) -> {
+            if (con.kicked) return;
+            Events.fire(new EventType.ConnectPacketEvent(con, packet));
+            con.connectTime = Time.millis();
+            String uuid = packet.uuid;
+            String name = packet.name;
+            String ip = con.address;
+            if (netServer.admins.isIPBanned(con.address) || netServer.admins.isSubnetBanned(con.address) || netServer.admins.isIDBanned(uuid)) {
+                con.kick("You have been banned. If you think it is unreasonable, please go to our discord group to unban!\nhttps://discord.gg/6vxqgszCkE", 0);
+                return;
+            }
+            if (name == null || name.trim().isEmpty() || containsBannedWord(name) || name.length() < 2 || name.length() > 40) {
+                con.kick("Your name may be illegal, or exceed 40 characters, or be less than 2 characters.", 0);
+                return;
+            }
+
+            if (con.hasBegunConnecting) {
+                con.kick(Packets.KickReason.idInUse, 0);
+                return;
+            }
+            con.hasBegunConnecting = true;
+            con.mobile = packet.mobile;
+            if (packet.uuid == null || packet.usid == null) {
+                con.kick(Packets.KickReason.idInUse, 0);
+                return;
+            }
+
+            long kickTime = Vars.netServer.admins.getKickTime(uuid, ip);
+            if (Time.millis() < kickTime) {
+                con.kick("You were recently kicked. Please wait.", 0);
+                return;
+            }
+
+            Seq<String> extraMods = packet.mods.copy();
+            Seq<String> missingMods = mods.getIncompatibility(extraMods);
+
+            if (!extraMods.isEmpty() || !missingMods.isEmpty()) {
+
+                StringBuilder result = new StringBuilder("[accent]Incompatible mods![]\n\n");
+
+                if (!missingMods.isEmpty()) {
+                    result.append("Missing:[lightgray]\n").append("> ").append(missingMods.toString("\n> "));
+                    result.append("[]\n");
+                }
+
+                if (!extraMods.isEmpty()) {
+                    result.append("Unnecessary mods:[lightgray]\n").append("> ").append(extraMods.toString("\n> "));
+                }
+
+                con.kick(result.toString(), 0);
+            }
+
+            if (packet.versionType == null || ((packet.version == -1 || !packet.versionType.equals(Version.type)) && Version.build != -1 && !netServer.admins.allowsCustomClients())) {
+                con.kick(!Version.type.equals(packet.versionType) ? Packets.KickReason.typeMismatch : Packets.KickReason.customClient, 0);
+                return;
+            }
+
+            if (packet.version != Version.build && Version.build != -1 && packet.version != -1) {
+                con.kick(packet.version > Version.build ? Packets.KickReason.serverOutdated : Packets.KickReason.clientOutdated, 0);
+                return;
+            }
+
+            if (Groups.player.contains(p -> p.name.equalsIgnoreCase(packet.name))) {
+                con.kick(Packets.KickReason.nameInUse, 0);
+                return;
+            }
+
+            if (!netServer.admins.isAdmin(uuid, packet.usid) && netServer.admins.getPlayerLimit() > 0 && Groups.player.size() >= netServer.admins.getPlayerLimit()) {
+                con.kick(Packets.KickReason.playerLimit);
+                return;
+            }
+
+            if (Groups.player.contains(p -> p.uuid().equals(uuid) || p.usid().equals(packet.usid))) {
+                con.kick(Packets.KickReason.idInUse, 0);
+                return;
+            }
+
+            for (NetConnection other : Vars.net.getConnections()) {
+                if (other != con && uuid.equals(other.uuid)) {
+                    con.kick(Packets.KickReason.idInUse, 0);
+                    return;
+                }
+            }
+
+            packet.name = Vars.netServer.fixName(packet.name);
+            if (packet.locale == null) packet.locale = "en";
+            Vars.netServer.admins.updatePlayerJoined(uuid, ip, packet.name);
+
+            if (packet.version == -1) {
+                con.modclient = true;
+            }
+
+            if (!Vars.netServer.admins.isWhitelisted(packet.uuid, packet.usid)) {
+                con.kick("You are not whitelisted.", 0);
+                return;
+            }
+
+            Administration.PlayerInfo info = Vars.netServer.admins.getInfo(uuid);
+
+            Player player = Player.create();
+            player.admin = Vars.netServer.admins.isAdmin(uuid, packet.usid);
+            player.con = con;
+            player.con.usid = packet.usid;
+            player.con.uuid = uuid;
+            player.con.mobile = packet.mobile;
+            player.name = packet.name;
+            player.locale = packet.locale;
+            player.color.set(packet.color).a(1f);
+            if (!player.admin && !info.admin) {
+                info.adminUsid = packet.usid;
+            }
+
+            con.player = player;
+            player.team(Vars.netServer.assignTeam(player));
+            Vars.netServer.sendWorldData(player);
+            Events.fire(new EventType.PlayerConnect(player));
+        });
+        
+        Vars.netServer.admins.addActionFilter(action -> {
+            if (action.type == Administration.ActionType.depositItem && action.player != null) {
+                String uuid = action.player.uuid();
+                long now = System.nanoTime();
+                long last = lastUnloadMap.get(uuid, 0L);
+                if (now - last < 1_500_000_000L) {
+                    return false;
+                }
+                lastUnloadMap.put(uuid, now);
+            }
+            return true;
+        });
+
+        Vars.net.handleServer(Packets.Connect.class, (con, packet) -> {
+            Events.fire(new EventType.ConnectionEvent(con));
+            var connections = Seq.with(Vars.net.getConnections()).select(c -> c.address.equals(con.address));
+            if (connections.size >= 4) {
+                Vars.netServer.admins.blacklistDos(con.address);
+                connections.each(NetConnection::close);
+            }
+        });
+
+        netServer.admins.addChatFilter((player, message) -> {
+            if (message == null) return null;
+            String lowerMessage = message.trim().toLowerCase();
+            if (message.startsWith("/") || isYes(lowerMessage)) {
+                if (voteInProgress && isYes(lowerMessage) && player != voteInitiator && !votes.contains(player.uuid())) {
+                    votes.add(player.uuid());
+                    int currentVotes = votes.size;
+                    int required = (int) Math.ceil(Groups.player.size() * ratio);
+                    if (kickVote && targetPlayer != null) {
+                        Call.sendMessage("[#DEE5F5FF]" + player.name + " voted to kick " + targetPlayer.name + ". [white](" + currentVotes + "/" + required + ")[]");
+                        if (currentVotes >= required) {
+                            Call.sendMessage("[#DEE5F5FF]Vote passed. Kicking " + targetPlayer.name + ".[]");
+                            targetPlayer.kick("[#DEE5F5FF]You were kicked by vote.[]");
+                            endVote();
+                        }
+                    } else if (!kickVote && targetMap != null) {
+                        Call.sendMessage("[#F1F1F1FF]" + player.name + "[][#DEE5F5FF] voted to change the map to [][#F1F1F1FF]" + targetMap.name() + "[][#F1F1F1FF]. " + currentVotes + "[][#DEE5F5FF] votes, [][#F1F1F1FF]" + required + "[][#DEE5F5FF] required." + "\n" + "Type[] [#F1F1F1FF]y[] [#DEE5F5FF]to vote.");
+                        if (currentVotes >= required) {
+                            Call.sendMessage("[#DEE5F5FF]Vote passed. Loading map " + targetMap.name() + ".[]");
+                            loadMap(targetMap);
+                            endVote();
+                            resetGameState();
+                            gameStartTime = Time.millis();
+                        }
+                    }
+                }
+            } else {
+                String name = player.name;
+                player.sendMessage(name + ": " + message);
+                Groups.player.each(receiver -> {
+                    if (receiver == player) return;
+                    String lang = playerLang.get(receiver.uuid());
+                    boolean needTranslate = !receiver.locale.equals(player.locale()) && lang != null && !"off".equals(lang);
+                    if (needTranslate) {
+                        translate(message, "auto", lang, translated -> {
+                            if (!translated.equals(message)) {
+                                receiver.sendMessage( name + "[]: [#EDF4FCCC]" + message + " [gray](" + translated + ")[]");
+                            } else {
+                                receiver.sendMessage(name + "[]: [#EDF4FCCC]" + message + "[]");
+                            }
+                        }, () -> receiver.sendMessage(name + "[]: [#EDF4FCCC]" + message + "[]"));
+                    } else {
+                        receiver.sendMessage(name + "[]: [#EDF4FCCC]" + message + "[]");
+                    }
+                });
+
+            }
+
+            return null;
+        });
+    }
+
     public SimplePlugin() {
         Events.on(ServerLoadEvent.class, s -> {
-            load();
-            webInit();
-            loadTime();
-            loadRank();
-            showLeaderboard();
             Timer.schedule(() -> {
-                if (!Vars.state.isGame()) {
-                    Config.desc.set("Welcome to Snow!");return;
+                if (!state.isGame()) {
+                    Config.desc.set("Welcome to snow!");return;
                 }
                 Groups.player.each(p -> addTime(p.uuid(), 0.06f));
                 long duration = Time.timeSinceMillis(gameStartTime);
@@ -523,6 +804,7 @@ public class SimplePlugin extends Plugin {
             } catch (Exception e) {
                 Log.err("Web server failed to start:", e);
             }
+
             Timer.schedule(() -> {
                 cleanUpExpiredTokens();
                 long duration = Time.timeSinceMillis(gameStartTime);
@@ -541,51 +823,20 @@ public class SimplePlugin extends Plugin {
             }
         });
 
-        Events.on(PlayerChatEvent.class, e -> {
-            Player sender = e.player;
-            String rawMessage = e.message;
-            if (rawMessage == null) return;
-            String lowerMessage = rawMessage.trim().toLowerCase();
-            if (rawMessage.startsWith("/") || isYes(lowerMessage)) {
-                if (voteInProgress && isYes(lowerMessage) && sender != voteInitiator && !votes.contains(sender.uuid())) {
-                    votes.add(sender.uuid());
-                    int currentVotes = votes.size;
-                    int required = (int) Math.ceil(Groups.player.size() * ratio);
-                    if (kickVote && targetPlayer != null) {
-                        Call.sendMessage("[#D1DBF2FF]" + sender.name + " voted to kick " + targetPlayer.name + ". [white](" + currentVotes + "/" + required + ")[]");
-                        if (currentVotes >= required) {
-                            Call.sendMessage("[#D1DBF2FF]Vote passed. Kicking " + targetPlayer.name + ".[]");
-                            targetPlayer.kick("[#D1DBF2FF]You were kicked by vote.[]");
-                            endVote();
-                        }
-                    } else if (!kickVote && targetMap != null) {
-                        Call.sendMessage("[#FFFFFFFF]" + sender.name + "[][#D1DBF2FF] voted to change the map to [][#FFFFFFFF]" + targetMap.name() + "[][#FFFFFFFF]. " + currentVotes + "[][#D1DBF2FF] votes, [][#FFFFFFFF]" + required + "[][#D1DBF2FF] required." + "\n" + "Type[] [#FFFFFFFF]y[] [#D1DBF2FF]to vote.");
-                        if (currentVotes >= required) {
-                            Call.sendMessage("[#D1DBF2FF]Vote passed. Loading map " + targetMap.name() + ".[]");
-                            loadMap(targetMap);
-                            endVote();
-                            resetGameState();
-                        }
-                    }
-                }
-            } else {
-                Groups.player.each(receiver -> {
-                    if (receiver == null || receiver == sender) return;
-
-                    String lang = playerLang.get(receiver.uuid());
-                    if (lang == null || "off".equals(lang)) return;
-                    if (receiver.locale.equals(sender.locale())) {
-                        return;
-                    }
-                    translate(rawMessage, "auto", lang, translated -> {
-                        if (!translated.equals(rawMessage)) {
-                            receiver.sendMessage("[#EDF4FCBB]" + sender.name + ": " + translated + "[]");
-                        }
-                    }, () -> localeAsyncOne("Translation failed!", receiver));
-                });
+        Events.on(WorldLoadEvent.class, e -> Timer.schedule(() -> Groups.player.each(this::showMapLabel), 2f));
+        Events.on(EventType.PlayEvent.class, event -> {
+            String mapDescription = Vars.state.map.description();
+            state.rules.ambientLight.set(new Color(0.1f, 0.1f, 0.2f, 0.3f));
+            state.rules.lighting = true;
+            Weather.WeatherEntry entry = new Weather.WeatherEntry();
+            entry.weather = Weathers.snow;
+            entry.intensity = 1f;
+            entry.always = true;
+            state.rules.weather.add(entry);
+            if (mapDescription.contains("[@fly]")) {
+                applyfly();
             }
         });
-
         Events.on(PlayerLeave.class, e -> {
             Player player = e.player;
             if (player == null || player.uuid() == null) return;
@@ -599,8 +850,8 @@ public class SimplePlugin extends Plugin {
                 Call.sendMessage("[#D1DBF2DD]" + name + " left, " + cur + " votes, " + req + " required.[]");
             }
 
-            if (Vars.state.rules != null
-                    && Vars.state.rules.mode() == Gamemode.pvp
+            if (state.rules != null
+                    && state.rules.mode() == Gamemode.pvp
                     && player.team() != null
                     && player.team() != Team.derelict) {
                 playerTeams.put(uuid, player.team());
@@ -613,16 +864,17 @@ public class SimplePlugin extends Plugin {
             gameStartTime = Time.millis();
             if (e.winner != null &&
                     e.winner != Team.derelict &&
-                    Vars.state.teams.get(e.winner).hasCore() &&
+                    state.teams.get(e.winner).hasCore() &&
                     Groups.player.count(p -> p.team() == e.winner) > 0) {
+
                 Seq<Player> winners = Groups.player.copy().select(p -> p.team() == e.winner);
+                Call.sendMessage("[#D1DBF2DD]Game over! [#" + e.winner.color.toString() + "]" + e.winner.name + "[] team wins!");
                 int total = winners.size;
-                int score = Math.max(25, 40 - total / 4);
+                int score = Math.max(25, 40 - total * 4);
                 for (Player p : winners) {
                     addRank(p.uuid(), score);
                     p.sendMessage("[#D1DBF2DD]You got " + score + " points![]");
                 }
-                Call.sendMessage("[#D1DBF2DD][#" + e.winner.color.toString() + "]" + e.winner.name + "[] team wins![]");
             }
             java.io.File folder = new java.io.File("config/snapshots");
             if (folder.exists()) {
@@ -636,65 +888,39 @@ public class SimplePlugin extends Plugin {
         Events.on(PlayerJoin.class, e -> {
             Player player = e.player;
             if (player == null || player.con == null) return;
-            String name = player.name != null ? player.name : "";
             String ip = player.con.address != null ? player.con.address : "unknown";
             String playerUUID = player.uuid() != null ? player.uuid() : UUID.randomUUID().toString(); // fallback uuid
-
-            if (!isValidName(name)) {
-                String raw = "Your name is illegal or contains special characters or is longer than 40 characters.";
-                localeAsync(raw, player,
-                        translated -> {
-                            if (player.con != null) player.con.kick(translated);
-                        },
-                        () -> {
-                            if (player.con != null) player.con.kick(raw);
-                        }
-                );
-                return;
-            }
-
             if (!playtimeData.containsKey(playerUUID)) {
                 updatePlaytime(playerUUID, 0f);
             }
-
             if (isNewIP(ip)) {
-                if (player.team() == null) {
-                    Log.warn("Cannot move player to derelict: player or team is null.");
-                    return;
-                }
-                lastTeams.put(playerUUID, player.team());
-                player.team(Team.derelict);
-                confirm(player);
+                confirm(player.con);
                 Timer.Task task = Timer.schedule(() -> {
                     Player p = Groups.player.find(pl -> pl.uuid().equals(playerUUID));
                     if (p == null || p.con == null) return;
                     if (playerUUID != null) {
-                        p.kick("Did not confirm within 1 minute.");
+                        p.kick("Did not confirm within 15s");
                     }
                     confirmTasks.remove(playerUUID);
-                }, 60f);
-                confirmTasks.put(player.uuid(), task);
+                }, 10f);
+                confirmTasks.put(playerUUID, task);
             } else {
                 String motdRaw = "Welcome to Snow!";
                 localeAsync(motdRaw, player, player::sendMessage, () -> player.sendMessage(motdRaw));
                 Team newTeam = playerTeams.get(playerUUID);
-                boolean isPVP = Vars.state.rules != null && Vars.state.rules.mode() == Gamemode.pvp;
+                boolean isPVP = state.rules != null && state.rules.mode() == Gamemode.pvp;
                 Team playerTeam = player.team();
-                Teams.TeamData teamData = (Vars.state != null && Vars.state.teams != null) ? Vars.state.teams.get(playerTeam) : null;
-                Teams.TeamData newTeamData = (newTeam != null && Vars.state != null && Vars.state.teams != null)
-                        ? Vars.state.teams.get(newTeam)
-                        : null;
+                Teams.TeamData teamData = (state != null && state.teams != null) ? state.teams.get(playerTeam) : null;
+                Teams.TeamData newTeamData = (newTeam != null && state != null && state.teams != null) ? state.teams.get(newTeam) : null;
                 boolean teamHasCore = teamData != null && teamData.hasCore();
                 boolean hasLost = Boolean.TRUE.equals(lostTeam.get(playerUUID)); // null 或 false 均视为未败队
-                if (isPVP){
+                if (isPVP) {
                     if (hasLost) {
                         localeAsyncOne("Your team has lost. Please wait for the next round.", player);
                         player.team(Team.derelict);
                     } else {
                         if (newTeam != null && playerTeam != newTeam && newTeamData != null && newTeamData.hasCore()) {
-                            lastTeams.put(playerUUID, player.team());
-                            player.team(Team.derelict);
-                            welcome(player);
+                            welcome(player.con);
                         } else if (!teamHasCore) {
                             assignFallbackTeamIfNoCore(player);
                         }
@@ -702,6 +928,7 @@ public class SimplePlugin extends Plugin {
                 }
             }
 
+            showMapLabel(player);
             if (!playerLang.containsKey(playerUUID)) {
                 String lang = player.locale;
                 String detectedLang = (lang == null || lang.isEmpty()) ? "en" : lang;
@@ -715,17 +942,26 @@ public class SimplePlugin extends Plugin {
             var team = event.tile.team();
 
             if (event.tile.block() instanceof CoreBlock) {
+                Groups.player.each(p -> {
+                    if (!p.team().active()) return;
+                    float cx = p.unit() != null ? p.unit().x : p.x;
+                    float cy = p.unit() != null ? p.unit().y : p.y;
+                    if (p.team() == team) {
+                        Call.labelReliable(p.con, "Your core has been destroyed", 3f, cx, cy);
+                    }
+                });
+
                 if (team != Team.derelict && team.cores().size <= 1) {
                     team.data().players.each(p -> {
-                        if (Vars.state.rules.mode() == Gamemode.pvp) {
+                        if (state.rules.mode() == Gamemode.pvp) {
                             localeAsyncOne("Your team has lost. Please wait for the next round.", p);
                             int size = Math.max(1, team.data().players.size);
-                            int penalty = Math.max(20, 40 - size / 3);
+                            int penalty = Math.max(20, 50 - size * 3);
                             Integer oldValue = rankData.get(p.uuid());
                             int old = oldValue != null ? oldValue : 0;
                             int updated = Math.max(0, old - penalty);
-                            updateRankTime(p.uuid(), updated);
-                            p.sendMessage("[#D1DBF2FF]You lost " + penalty + " points[]!");
+                            updateRank(p.uuid(), updated);
+                            p.sendMessage("[#DEE5F5FF]You lost " + penalty + " points[]!");
                             lostTeam.put(p.uuid(), true);
                             p.team(Team.derelict);
                             p.clearUnit();
@@ -748,20 +984,42 @@ public class SimplePlugin extends Plugin {
         handler.removeCommand("votekick");
         handler.<Player>register("t", "<message...>", "Send a message only to your teammates.", (args, player) -> {
             if (args.length == 0) {
-                player.sendMessage("[#D1DBF2FF]You must enter a message to send to your teammates.");
+                player.sendMessage("[#DEE5F5FF]You must enter a message to send to your teammates.[#DEE5F5FF]");
                 return;
             }
-            String message = args[0];
-            String formatted = "<Team> " + player.name + ": " + message;
-            Groups.player.each(p -> p.team() == player.team(), teammate -> teammate.sendMessage(formatted));
+            String message = String.join(" ", args);
+            String formatted = "[#DEE5F5FF]<Team> [#DEE5F5FF]" + player.name + "[]: [#DEE5F5FF]" + message + "[]";
+            player.sendMessage(formatted);
+            Groups.player.each(receiver -> {
+                if (receiver == player || receiver.team() != player.team()) return;
+                String lang = playerLang.get(receiver.uuid());
+                boolean needsTranslation = !receiver.locale.equals(player.locale()) && lang != null && !lang.equals("off");
+                String prefix = "[#DEE5F5FF]<Team> [#DEE5F5FF]" + player.name + "[]: [#DEE5F5FF]";
+                if (needsTranslation) {
+                    translate(message, "auto", lang,
+                            translated -> {
+                                if (!translated.equals(message)) {
+                                    receiver.sendMessage(prefix + message + " [gray](" + translated + ")[]");
+                                } else {
+                                    receiver.sendMessage(prefix + message);
+                                }
+                            },
+                            () -> receiver.sendMessage(prefix + message)
+                    );
+                } else {
+                    receiver.sendMessage(prefix + message);
+                }
+            });
         });
+
+
         handler.<Player>register("help", "[page]", "List all available commands.", (args, player) -> {
             int page = 1;
             if (args.length > 0) {
                 try {
                     page = Integer.parseInt(args[0]);
                 } catch (NumberFormatException e) {
-                    player.sendMessage("[#D1DBF2FF]Invalid page number.[]");
+                    player.sendMessage("[#DEE5F5FF]Invalid page number.[]");
                     return;
                 }
             }
@@ -772,61 +1030,23 @@ public class SimplePlugin extends Plugin {
             int totalPages = (int) Math.ceil((double) totalCommands / commandsPerPage);
 
             if (page < 1 || page > totalPages) {
-                player.sendMessage("[#D1DBF2FF]Invalid page number. Please enter a valid page number between 1 and " + totalPages + ".[]");
+                player.sendMessage("[#DEE5F5FF]Invalid page number. Please enter a valid page number between 1 and " + totalPages + ".[]");
                 return;
             }
 
             int startIndex = (page - 1) * commandsPerPage;
             int endIndex = Math.min(page * commandsPerPage, totalCommands);
 
-            StringBuilder result = new StringBuilder("[#FFFFFFFF]Available Commands (Page " + page + "/" + totalPages + "):[]\n");
+            StringBuilder result = new StringBuilder("[#DEE5F5FF]---- Available Commands " + page + "/" + totalPages + " ----[#F1F1F1FF]\n\n");
 
             for (int i = startIndex; i < endIndex; i++) {
                 CommandHandler.Command cmd = commandList.get(i);
-                result.append("[#D1DBF2FF]/").append(cmd.text);
-                if (!cmd.paramText.isEmpty()) result.append(" ").append(cmd.paramText);
-                result.append("[] - ").append(cmd.description).append("\n");
+                result.append("[#DEE5F5FF]/").append(cmd.text);
+                if (!cmd.paramText.isEmpty()) result.append(" [#F1F1F1FF]").append(cmd.paramText).append("[]");
+                result.append("[] - [#F1F1F1FF]").append(cmd.description).append("[]\n");
             }
 
             player.sendMessage(result.toString());
-        });
-
-        handler.<Player>register("snow", "Summon Snow.", (args, player) -> {
-            if (snowCommandUsed) {
-                player.sendMessage("[#D1DBF2FF]The snow magic has already been cast in this game.");
-                Call.effect(Fx.breakProp, player.x, player.y, 0, Color.white);
-                Call.effect(Fx.lightning, player.x, player.y, 0, Color.white);
-                return;
-            }
-            String playerUUID = player.uuid();
-            int current = rankData.containsKey(playerUUID) ? rankData.get(playerUUID) : 0;
-            if (player.admin || current > 50) {
-                Vars.state.rules.ambientLight.set(new Color(0.1f, 0.1f, 0.2f, 0.8f));
-                Vars.state.rules.lighting = true;
-                Weather.WeatherEntry entry = new Weather.WeatherEntry();
-                entry.weather = Weathers.snow;
-                entry.intensity = 1f;
-                entry.always = true;
-                Vars.state.rules.weather.add(entry);
-
-                for (Player p : Groups.player) {
-                    Call.worldDataBegin(p.con);
-                    netServer.sendWorldData(p);
-                }
-                snowCommandUsed = true;
-                Call.sendMessage("[#FFFFFFFF]" + player.name + "[][#D1DBF2FF] has summoned gentle snow upon the land.[]");
-                Call.effect(Fx.healWave, player.x, player.y, 0, Color.white);
-                Call.effect(Fx.lightning, player.x, player.y, 0, Color.white);
-            } else {
-                for (int i = 0; i < 3; i++) {
-                    float angle = i * 120f;
-                    float radius = 20f;
-                    float fx = player.x + Mathf.cosDeg(angle) * radius;
-                    float fy = player.y + Mathf.sinDeg(angle) * radius;
-                    Call.effect(Fx.smeltsmoke, fx, fy, 0, Color.white);
-                }
-                player.sendMessage("[#D1DBF2FF]You must be an admin or has 50+ points.");
-            }
         });
 
         handler.<Player>register("time", "Show time.", (args, player) -> {
@@ -834,8 +1054,8 @@ public class SimplePlugin extends Plugin {
             int minutes = (int) (duration / 1000 / 60);
             float totalMinutes = playtimeData.get(player.uuid(), 0f);
 
-            player.sendMessage("[#D1DBF2FF]Game played: [] " + minutes + " minutes[]");
-            player.sendMessage("[#D1DBF2FF]Your total play time: [] " + String.format("%.2f", totalMinutes) + " minutes[]");
+            player.sendMessage("[#DEE5F5FF]Game played: [] [#DEE5F5FF]" + minutes + " minutes[]");
+            player.sendMessage("[#DEE5F5FF]Your total play time: [] [#DEE5F5FF]" + String.format("%.2f", totalMinutes) + " minutes[]");
         });
 
         handler.<Player>register("rollback", "[name/index]", "Rollback to a snapshot", (args, player) -> {
@@ -843,7 +1063,7 @@ public class SimplePlugin extends Plugin {
 
             java.io.File[] files = folder.listFiles((dir, name) -> name.startsWith("autosave-") && name.endsWith(".msav"));
             if (files == null || files.length == 0) {
-                player.sendMessage("[#D1DBF2FF]No snapshots available.[]");
+                player.sendMessage("[#DEE5F5FF]No snapshots available.[]");
                 return;
             }
 
@@ -856,18 +1076,19 @@ public class SimplePlugin extends Plugin {
             }
 
             if (args.length == 0) {
-                StringBuilder sb = new StringBuilder("[#FFFFFF]Available snapshots:\n");
+                StringBuilder sb = new StringBuilder("[#FFFFFF]Available snapshots:[#DEE5F5FF]\n\n");
                 for (int i = 0; i < readableNames.size(); i++) {
-                    sb.append("[#D1DBF2FF]").append(i).append("[]: ").append(readableNames.get(i)).append("\n");
+                    sb.append("[#DEE5F5FF]").append(i).append("[]: ").append(readableNames.get(i)).append("\n");
                 }
                 player.sendMessage(sb.toString());
                 return;
             }
+
             java.io.File targetFile = null;
             String input = args[0];
 
             if (!player.admin && args[0] != null) {
-                player.sendMessage("[#D1DBF2FF]You are not an admin.[]");
+                player.sendMessage("[#DEE5F5FF]You are not an admin.[]");
                 return;
             }
 
@@ -875,7 +1096,7 @@ public class SimplePlugin extends Plugin {
             if (input.matches("\\d+")) {
                 int index = Integer.parseInt(input);
                 if (index < 0 || index >= files.length) {
-                    player.sendMessage("[#D1DBF2FF]Invalid snapshot index.[]");
+                    player.sendMessage("[#DEE5F5FF]Invalid snapshot index.[]");
                     return;
                 }
                 targetFile = files[index];
@@ -889,7 +1110,7 @@ public class SimplePlugin extends Plugin {
                     }
                 }
                 if (!matched) {
-                    player.sendMessage("[#D1DBF2FF]No snapshot matches name '" + input + "'[]");
+                    player.sendMessage("[#DEE5F5FF]No snapshot matches name '" + input + "'[]");
                     return;
                 }
             }
@@ -897,15 +1118,15 @@ public class SimplePlugin extends Plugin {
             final java.io.File finalTargetFile = targetFile;
 
             try {
-
-                if (Vars.state.isGame()) {
+                if (state.isGame()) {
                     Groups.player.each(eplayer -> eplayer.kick(Packets.KickReason.serverRestarting));
-                    Vars.state.set(GameState.State.menu);
+                    state.set(GameState.State.menu);
                     Vars.net.closeServer();
                 }
+
                 reloadWorld(() -> {
                     SaveIO.load(new Fi(finalTargetFile));
-                    Vars.state.set(GameState.State.playing);
+                    state.set(GameState.State.playing);
                     netServer.openServer();
                     resetGameState();
                 });
@@ -925,16 +1146,16 @@ public class SimplePlugin extends Plugin {
                 String token = TokenManager.generateToken();
                 int port = config.port;
                 String url = "http://" + globalUrl + ":" + port + "/?token=" + token;
-                player.sendMessage("[#FFFFFFFF]Upload link (valid 5 min): [][#D1DBF2FF]" + url + "[]");
+                player.sendMessage("[#F1F1F1FF]Upload link (valid 5 min): [][#DEE5F5FF]" + url + "[]");
                 Call.openURI(player.con, url);
             } else {
-                player.sendMessage("[#D1DBF2FF]You need 50+ points or admin to upload maps. Max size: 200×200. Must fit current mode.");
+                player.sendMessage("[#DEE5F5FF]You need 50+ points or admin to upload maps. Max size: 200×200. Must fit current mode.");
             }
         });
 
         handler.<Player>register("discord", "Discord link.", (args, player) -> {
-            String url ="https://discord.gg/ajvwQMx8";
-            player.sendMessage("[#FFFFFFFF]Invite link: [][#D1DBF2FF]" + url + "[]");
+            String url ="https://discord.gg/6vxqgszCkE";
+            player.sendMessage("[#F1F1F1FF]Invite link: [][#DEE5F5FF]" + url + "[]");
             Call.openURI(player.con, url);
         });
 
@@ -947,16 +1168,16 @@ public class SimplePlugin extends Plugin {
 
                 if (!player.admin) {
                     player.admin = true;
-                    player.sendMessage("[#D1DBF2FF]You are now an admin.[]");
+                    player.sendMessage("[#DEE5F5FF]You are now an admin.[]");
                 } else {
                     player.admin = false;
-                    player.sendMessage("[#D1DBF2FF]You are no longer an admin.[]");
+                    player.sendMessage("[#DEE5F5FF]You are no longer an admin.[]");
 
                     approvedAdmins.put(player.uuid(), true);
                 }
 
             } else {
-                player.sendMessage("[#D1DBF2FF]You need at least 1000 points to become admin. Current: "
+                player.sendMessage("[#DEE5F5FF]You need at least 1000 points to become admin. Current: "
                         + String.format("%d", current) + "[]");
             }
         });
@@ -964,7 +1185,7 @@ public class SimplePlugin extends Plugin {
 
         handler.<Player>register("tr", "[language]", "Set your language for automatic translation.", (args, player) -> {
             if (args.length != 1) {
-                player.sendMessage("[#D1DBF2FF]Usage: /tr [auto/off/zh/en/es/fr/de/ja/ko/ru/tr][]");
+                player.sendMessage("[#DEE5F5FF]Usage: /tr [auto/off/zh/en/es/fr/de/ja/ko/ru/tr][]");
                 return;
             }
 
@@ -972,22 +1193,22 @@ public class SimplePlugin extends Plugin {
 
             if (targetLanguage.equals("off")) {
                 playerLang.put(player.uuid(), "off");
-                player.sendMessage("[#D1DBF2FF]Automatic translation turned off.[]");
+                player.sendMessage("[#DEE5F5FF]Automatic translation turned off.[]");
                 return;
             }
             if (targetLanguage.equals("auto")) {
                 playerLang.put(player.uuid(), player.locale());
-                player.sendMessage("[#D1DBF2FF]The language is automatically set to " + player.locale + ".[]");
+                player.sendMessage("[#DEE5F5FF]The language is automatically set to " + player.locale + ".[]");
                 return;
             }
 
             if (!languageMapping.containsKey(targetLanguage)) {
-                player.sendMessage("[#D1DBF2FF]Invalid language name. Please use a valid language name." + "[]");
+                player.sendMessage("[#DEE5F5FF]Invalid language name. Please use a valid language name." + "[]");
                 return;
             }
 
             playerLang.put(player.uuid(), languageMapping.get(targetLanguage));
-            player.sendMessage("[#D1DBF2FF]Language set to " + targetLanguage + " for translations.[]");
+            player.sendMessage("[#DEE5F5FF]Language set to " + targetLanguage + " for translations.[]");
         });
 
         handler.<Player>register("maps", "[page]", "List all available maps.", (args, player) -> {
@@ -996,7 +1217,7 @@ public class SimplePlugin extends Plugin {
                 try {
                     page = Integer.parseInt(args[0]);
                 } catch (NumberFormatException e) {
-                    player.sendMessage("[#D1DBF2FF]Invalid page number.[]");
+                    player.sendMessage("[#DEE5F5FF]Invalid page number. Please enter a valid number.[]");
                     return;
                 }
             }
@@ -1008,30 +1229,34 @@ public class SimplePlugin extends Plugin {
             int totalPages = (int) Math.ceil((double) totalMaps / mapsPerPage);
 
             if (page < 1 || page > totalPages) {
-                player.sendMessage("[#D1DBF2FF]Invalid page number. Please enter a valid page number between 1 and " + totalPages + ".[]");
+                player.sendMessage("[#DEE5F5FF]Invalid page number. Please enter a valid page number between 1 and " + totalPages + ".[]");
                 return;
             }
 
             int startIndex = (page - 1) * mapsPerPage;
             int endIndex = Math.min(page * mapsPerPage, totalMaps);
 
-            StringBuilder mapList = new StringBuilder("[#FFFFFFFF]Current Map: [][#D1DBF2FF]" + Vars.state.map.name() + "[]\n");
-            mapList.append("[#FFFFFFFF]Available Maps (Page ").append(page).append("/").append(totalPages).append("):[]\n");
+            StringBuilder mapList = new StringBuilder();
+            mapList.append("[#DEE5F5FF]---- Available Maps ").append(page).append("/").append(totalPages).append(" ----[#F1F1F1FF]\n\n");
 
             for (int i = startIndex; i < endIndex; i++) {
-                mapList.append("[#D1DBF2FF]").append(i + 1).append(". ").append(availableMaps.get(i).name()).append("[]\n");
+                Map map = availableMaps.get(i);
+                String author = map.author() != null ? map.author() : "[#DEE5F5FF]Unknown";
+                mapList.append("[#DEE5F5FF]").append(i + 1).append(". [#F1F1F1FF]").append(map.name()).append("[] ");
+                mapList.append("[#DEE5F5FF]by [#F1F1F1FF]").append(author).append("[]\n");
             }
 
             player.sendMessage(mapList.toString());
         });
 
+
         handler.<Player>register("lb", "Toggle leaderboard display.", (args, player) -> {
             if (lbEnabled.contains(player.uuid())) {
                 lbEnabled.remove(player.uuid());
-                player.sendMessage("[#D1DBF2FF]Leaderboard display disabled.[]");
+                player.sendMessage("[#DEE5F5FF]Leaderboard display disabled.[]");
             } else {
                 lbEnabled.add(player.uuid());
-                player.sendMessage("[#D1DBF2FF]Leaderboard display enabled.[]");
+                player.sendMessage("[#DEE5F5FF]Leaderboard display enabled.[]");
             }
         });
 
@@ -1041,7 +1266,7 @@ public class SimplePlugin extends Plugin {
                 try {
                     page = Integer.parseInt(args[0]);
                 } catch (NumberFormatException e) {
-                    player.sendMessage("[#D1DBF2FF]Invalid page number.[]");
+                    player.sendMessage("[#DEE5F5FF]Invalid page number.[]");
                     return;
                 }
             }
@@ -1056,12 +1281,12 @@ public class SimplePlugin extends Plugin {
             int totalPages = (int) Math.ceil((double) totalPlayers / playersPerPage);
 
             if (totalPlayers == 0) {
-                player.sendMessage("[#D1DBF2FF]No players have any points yet.[]");
+                player.sendMessage("[#DEE5F5FF]No players have any points yet.[]");
                 return;
             }
 
             if (page < 1 || page > totalPages) {
-                player.sendMessage("[#D1DBF2FF]Invalid page number. Please enter a valid page number between 1 and " + totalPages + ".[]");
+                player.sendMessage("[#DEE5F5FF]Invalid page number. Please enter a valid page number between 1 and " + totalPages + ".[]");
                 return;
             }
 
@@ -1069,12 +1294,12 @@ public class SimplePlugin extends Plugin {
 
             if (myScore > 0) {
                 int myRank = uuids.indexOf(player.uuid()) + 1;
-                message.append("[#FFFFFFFF]Your Rank: [][#D1DBF2FF]").append(myRank).append("/").append(totalPlayers)
+                message.append("[#F1F1F1FF]Your Rank: [][#DEE5F5FF]").append(myRank).append("/").append(totalPlayers)
                         .append(" | ").append(myScore).append(" []\n");
             } else {
-                message.append("[#D1DBF2FF]You have no points yet.[]\n");
+                message.append("[#DEE5F5FF]You have no points yet.[]\n");
             }
-            message.append("[#FFFFFFFF]Rankings (Page ").append(page).append("/").append(totalPages).append("):[]\n");
+            message.append("[#F1F1F1FF]Rankings (Page ").append(page).append("/").append(totalPages).append("):[]\n");
 
             int startIndex = (page - 1) * playersPerPage;
             int endIndex = Math.min(page * playersPerPage, totalPlayers);
@@ -1083,7 +1308,7 @@ public class SimplePlugin extends Plugin {
                 String id = uuids.get(i);
                 String name = Vars.netServer.admins.getInfo(id) != null ? Vars.netServer.admins.getInfo(id).lastName : "<unknown>";
                 int score = rankData.get(id, 0);
-                message.append("[#D1DBF2FF]").append(i + 1).append(". ").append(name).append(": ").append(score).append(" []\n");
+                message.append("[#DEE5F5FF]").append(i + 1).append(". ").append(name).append(": ").append(score).append(" []\n");
             }
 
             player.sendMessage(message.toString());
@@ -1092,7 +1317,7 @@ public class SimplePlugin extends Plugin {
 
         handler.<Player>register("rtv", "[mapId/name]","Vote to change map.", (args, player) -> {
             if (voteInProgress) {
-                player.sendMessage("[#D1DBF2FF]A vote is already in progress.[]");
+                player.sendMessage("[#DEE5F5FF]A vote is already in progress.[]");
                 return;
             }
 
@@ -1117,48 +1342,56 @@ public class SimplePlugin extends Plugin {
             }
 
             if (selected == null) {
-                player.sendMessage("[#D1DBF2FF]Map not found.[]");
+                player.sendMessage("[#DEE5F5FF]Map not found.[]");
                 return;
             }
 
             if (Groups.player.size() <= 1 || player.admin) {
-                Call.sendMessage("[#D1DBF2FF]" + player.name + " changed the map to " + selected.name() + ".[]");
+                Call.sendMessage("[#DEE5F5FF]" + player.name + " changed the map to " + selected.name() + ".[]");
                 loadMap(selected);
                 resetGameState();
+                gameStartTime = Time.millis();
                 return;
             }
 
-            beginVote(player, false, selected, null);
+            beginVote(player, false, selected, null, null);
         });
 
-        handler.<Player>register("votekick", "<player>", "Start a vote to kick a player", (args, player) -> {
+        handler.<Player>register("votekick", "[player] [reason]", "Start a vote to kick a player", (args, player) -> {
             if (voteInProgress) {
-                player.sendMessage("[#D1DBF2FF]A vote is already in progress.[]");
-                return;
+                player.sendMessage("[#DEE5F5FF]A vote is already in progress.[]");
+            } else {
+                if (args.length == 0) {
+                    StringBuilder builder = new StringBuilder();
+                    builder.append("[white]Players you can vote to kick:\n");
+                    Groups.player.each(p -> p.team() == player.team() && !p.admin && p.con != null && p != player, p -> builder.append("[#DEE5F5FF]").append(p.name).append(" (#").append(p.id()).append(")\n"));
+                    player.sendMessage(builder.toString());
+                } else {
+                    Player target;
+                    if (args[0].length() > 1 && args[0].startsWith("#") && Strings.canParseInt(args[0].substring(1))) {
+                        int id = Strings.parseInt(args[0].substring(1));
+                        target = Groups.player.find(p -> p.id() == id);
+                    } else {
+                        target = Groups.player.find(p -> p.name().toLowerCase().contains(args[0].toLowerCase()));
+                    }
+                    String reason = args.length > 1 ? String.join(" ", Arrays.copyOfRange(args, 1, args.length)) : null;
+                    if (target !=null) {
+                        if (target == player) {
+                            player.sendMessage("[#DEE5F5FF]You cannot kick yourself.[]");
+                        } else if (target.admin) {
+                            player.sendMessage("[#DEE5F5FF]You cannot kick an admin.[]");
+                        } else if (player.admin) {
+                            Call.sendMessage("[#DEE5F5FF]" + player.name + " kicked " + target.name + " directly. Reason: " + reason);
+                            target.kick("[#DEE5F5FF]You were kicked by an admin. Reason: " + reason);
+                        } else {
+                            beginVote(player, true, null, target, reason);
+                        }
+                    } else {
+                        player.sendMessage("[#DEE5F5FF]Player not found.[]");
+                    }
+                }
             }
-            if (args.length == 0) {
-                player.sendMessage("[#D1DBF2FF]You must specify a player to kick.[]");
-                return;
-            }
-
-            Player target = Groups.player.find(p -> p.name().toLowerCase().contains(args[0].toLowerCase()));
-
-            if (target == null) {
-                player.sendMessage("[#D1DBF2FF]Player not found.[]");
-                return;
-            }
-            if (target == player) {
-                player.sendMessage("[#D1DBF2FF]You cannot kick yourself.[]");
-                return;
-            }
-
-            if (player.admin) {
-                Call.sendMessage("[#D1DBF2FF]" + player.name + " kicked " + target.name + " directly.[]");
-                target.kick("[#D1DBF2FF]You were kicked by an admin.[]");
-                return;
-            }
-            
-            beginVote(player, true, null, target);
         });
+
     }
 }
