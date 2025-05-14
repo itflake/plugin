@@ -1,7 +1,6 @@
 package plugin;
 
 import arc.Events;
-import arc.graphics.Color;
 import arc.math.Mathf;
 import arc.net.Server;
 import arc.util.*;
@@ -67,7 +66,7 @@ public class SimplePlugin extends Plugin {
     private static Timer.Task voteTimer = null;
     private static final float voteDuration = 30f;
     private final HashSet<String> lbEnabled = new HashSet<>();
-    private final StringBuilder updatedBuilder = new StringBuilder(); // Store leaderboard data here
+    private final StringBuilder updatedBuilder = new StringBuilder();
     private static final double ratio = 0.6;
     private static final ObjectMap<String, Timer.Task> confirmTasks = new ObjectMap<>();
     private long gameStartTime = Time.millis();
@@ -292,11 +291,10 @@ public class SimplePlugin extends Plugin {
             reloader.begin();
             runnable.run();
             reloader.end();
-        } catch (Exception e) {  // Catching general exception
+        } catch (Exception e) {
             Log.err("Error while reloading map: " + e.getMessage());
         }
     }
-
 
     private static final int playerMenuId = Menus.registerMenu((player, choice) -> {
         if (choice == 1) {
@@ -309,7 +307,7 @@ public class SimplePlugin extends Plugin {
             String raw = "Welcome to snow!";
             String lang = player.locale();
             translate(raw, "auto", lang, translated -> Call.announce(player.con, translated), () -> Call.announce(player.con, raw));
-            Timer.schedule(() -> showMapLabel(player), 3f);
+            Timer.schedule(() -> showMapLabel(player), 5f);
         } else if (choice == 0) {
             String playerUUID = player.uuid();
             Timer.Task task = confirmTasks.remove(playerUUID);
@@ -444,7 +442,7 @@ public class SimplePlugin extends Plugin {
     }
 
     private static final String[] bannedWords = {
-            "admin", "gm", "moderator", "fuck", "傻逼", "操", "ばか", "병신", "лох", "nigga", "nigger", "习近平", "金正恩", "卐"
+            "admin", "fuck", "傻逼", "ばか", "병신", "лох", "nigga", "nigger", "习近平", "金正恩", "卐"
     };
 
     private boolean containsBannedWord(String name) {
@@ -456,7 +454,7 @@ public class SimplePlugin extends Plugin {
     }
 
     private boolean isYes(String message) {
-        return "y".equals(message) || "yes".equals(message);
+        return "y".equals(message);
     }
 
     static String wrapText(String text) {
@@ -579,8 +577,9 @@ public class SimplePlugin extends Plugin {
                 con.kick("You have been banned. If you think it is unreasonable, please go to our discord group to unban!\nhttps://discord.gg/6vxqgszCkE", 0);
                 return;
             }
-            if (name == null || name.trim().isEmpty() || containsBannedWord(name) || name.length() < 2 || name.length() > 40) {
-                con.kick("Your name may be illegal, or exceed 40 characters, or be less than 2 characters.", 0);
+            String plainName = name.replaceAll("\\[#(?:[a-fA-F0-9]{6}|[a-fA-F0-9]{8})\\]|\\[\\]", "");
+            if (name.trim().isEmpty() || containsBannedWord(plainName) || plainName.length() < 3 || plainName.length() > 10) {
+                con.kick("Your name may be illegal, or exceed 10 characters, or be less than 3 characters.", 0);
                 return;
             }
 
@@ -743,7 +742,7 @@ public class SimplePlugin extends Plugin {
                     if (needTranslate) {
                         translate(message, "auto", lang, translated -> {
                             if (!translated.equals(message)) {
-                                receiver.sendMessage( "[#DEE5F5FF]" + name + "[]: [#EDF4FCCC]" + message + " [gray](" + translated + ")[]");
+                                receiver.sendMessage( "[#DEE5F5FF]" + name + "[]: [#EDF4FCCC]" + message + " [#A9B0B3CC](" + translated + ")[]");
                             } else {
                                 receiver.sendMessage("[#DEE5F5FF]" + name + "[]: [#EDF4FCCC]" + message + "[]");
                             }
@@ -799,16 +798,11 @@ public class SimplePlugin extends Plugin {
 
         Events.on(EventType.PlayEvent.class, event -> {
             String mapDescription = Vars.state.map.description();
-            state.rules.ambientLight.set(new Color(0.1f, 0.1f, 0.2f, 0.3f));
-            state.rules.lighting = true;
             Weather.WeatherEntry entry = new Weather.WeatherEntry();
             entry.weather = Weathers.snow;
             entry.intensity = 0.3f;
             entry.always = true;
             state.rules.weather.add(entry);
-            if (mapDescription.contains("[@fly]")) {
-                applyfly();
-            }
             if (mapDescription.contains("[@fly]")) {
                 applyfly();
             }
